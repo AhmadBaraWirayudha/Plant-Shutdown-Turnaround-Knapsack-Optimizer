@@ -1,0 +1,212 @@
+// ============================================================
+//  DAX Measures — Plant Shutdown Turnaround Optimizer
+// ============================================================
+//
+//  Copy-paste these into a new Power BI measure (Modeling > New Measure)
+//  against any table — convention here is to put them all in a dedicated
+//  "_Measures" table for organization, but functionally they work
+//  regardless of which table hosts them since they all fully qualify
+//  their column references.
+//
+//  IMPORTANT: SQLite has no native boolean type. The `selected` and
+//  `mandatory` columns are stored as, and arrive in Power BI as, the
+//  INTEGERS 0 and 1 — verified directly against the actual database file,
+//  not assumed. Every measure below compares against 1, not TRUE(). If
+//  you've converted the column to Boolean type in Power Query, swap
+//  `= 1` for `= TRUE()` throughout.
+//
+//  Grain reminder: fact_work_order_decision is one row per (run_id, wo_id).
+//  Any visual NOT explicitly filtered or sliced to a single run_id will
+//  silently aggregate across every stored scenario at once — that's
+//  usually wrong for KPI cards. Most measures below filter to the latest
+//  run by default for that reason; use the *_AllRuns or *_ByRun variants
+//  when building the Scenario Comparison page intentionally.
+
+// ──────────────────────────────────────────────────────────────
+// Run / scenario helpers
+// ──────────────────────────────────────────────────────────────
+
+Latest Run ID =
+CALCULATE ( MAX ( dim_run[run_id] ) )
+
+// ──────────────────────────────────────────────────────────────
+// Core KPIs — scoped to the latest run by default
+// ──────────────────────────────────────────────────────────────
+
+Total Budget Used =
+CALCULATE (
+    SUM ( fact_work_order_decision[estimated_cost_usd] ),
+    fact_work_order_decision[selected] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Total Budget Used (All Runs) =
+CALCULATE (
+    SUM ( fact_work_order_decision[estimated_cost_usd] ),
+    fact_work_order_decision[selected] = 1
+)
+
+Budget Allocated =
+CALCULATE (
+    SELECTEDVALUE ( dim_run[budget_usd] ),
+    dim_run[run_id] = [Latest Run ID]
+)
+
+Budget Utilization % =
+DIVIDE ( [Total Budget Used], [Budget Allocated], 0 )
+
+Tasks Selected =
+CALCULATE (
+    COUNTROWS ( fact_work_order_decision ),
+    fact_work_order_decision[selected] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Tasks Total =
+CALCULATE (
+    COUNTROWS ( fact_work_order_decision ),
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Tasks Selected % =
+DIVIDE ( [Tasks Selected], [Tasks Total], 0 )
+
+Total Net Value =
+CALCULATE (
+    SUM ( fact_work_order_decision[net_value_usd] ),
+    fact_work_order_decision[selected] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+ROI Ratio =
+DIVIDE ( [Total Net Value], [Total Budget Used], 0 )
+
+Mandatory Tasks Count =
+CALCULATE (
+    COUNTROWS ( fact_work_order_decision ),
+    fact_work_order_decision[mandatory] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Mandatory Tasks Cost =
+CALCULATE (
+    SUM ( fact_work_order_decision[estimated_cost_usd] ),
+    fact_work_order_decision[mandatory] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+// ──────────────────────────────────────────────────────────────
+// Risk metrics
+// ──────────────────────────────────────────────────────────────
+
+Total Risk Score Addressed =
+CALCULATE (
+    SUM ( fact_work_order_decision[risk_score] ),
+    fact_work_order_decision[selected] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Total Risk Score Deferred =
+CALCULATE (
+    SUM ( fact_work_order_decision[risk_score] ),
+    fact_work_order_decision[selected] = 0,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Risk Score Reduction % =
+DIVIDE (
+    [Total Risk Score Addressed],
+    [Total Risk Score Addressed] + [Total Risk Score Deferred],
+    0
+)
+
+Deferred Risk Value =
+CALCULATE (
+    SUM ( fact_work_order_decision[deferred_cost_usd] ),
+    fact_work_order_decision[selected] = 0,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Critical Risk Tasks Deferred =
+CALCULATE (
+    COUNTROWS ( fact_work_order_decision ),
+    fact_work_order_decision[selected] = 0,
+    dim_risk_level[risk_level_name] = "CRITICAL",
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+// ──────────────────────────────────────────────────────────────
+// Craft-hour utilization
+// ──────────────────────────────────────────────────────────────
+
+Mech Hours Used =
+CALCULATE (
+    SUM ( fact_work_order_decision[mech_hours] ),
+    fact_work_order_decision[selected] = 1,
+    fact_work_order_decision[run_id] = [Latest Run ID]
+)
+
+Mech Hours Capacity =
+CALCULATE (
+    SELECTEDVALUE ( dim_run[max_mech_hours] ),
+    dim_run[run_id] = [Latest Run ID]
+)
+
+Mech Hours Utilization % =
+DIVIDE ( [Mech Hours Used], [Mech Hours Capacity], 0 )
+
+// Repeat the Mech Hours pattern for elec_hours / max_elec_hours,
+// inst_hours / max_inst_hours, and civil_hours / max_civil_hours
+// if you need all four trades broken out individually.
+
+// ──────────────────────────────────────────────────────────────
+// Scenario comparison (Budget Sensitivity page) — NOT run-filtered
+// ──────────────────────────────────────────────────────────────
+
+ROI by Run =
+CALCULATE (
+    DIVIDE (
+        SUM ( fact_work_order_decision[net_value_usd] ),
+        SUM ( fact_work_order_decision[estimated_cost_usd] )
+    ),
+    fact_work_order_decision[selected] = 1
+)
+// Drop this measure into a chart with dim_run[run_label] on the axis —
+// Power BI's row context from the axis does the per-run filtering for you;
+// no run_id condition needed inside the measure itself.
+
+Marginal Value per Run =
+VAR CurrentValue = [Total Net Value (All Runs Variant)]
+VAR PreviousRunValue =
+    CALCULATE (
+        [Total Net Value (All Runs Variant)],
+        FILTER (
+            ALL ( dim_run ),
+            dim_run[run_id] = MAX ( dim_run[run_id] ) - 1
+        )
+    )
+RETURN
+    CurrentValue - PreviousRunValue
+// Requires sequential run_ids with no gaps to be meaningful as "the
+// previous scenario" — true by construction since run_id is an
+// autoincrement primary key, but re-verify if rows were ever deleted
+// manually outside the optimizer's own writer.
+
+Total Net Value (All Runs Variant) =
+CALCULATE (
+    SUM ( fact_work_order_decision[net_value_usd] ),
+    fact_work_order_decision[selected] = 1
+)
+
+// ──────────────────────────────────────────────────────────────
+// Formatting helpers
+// ──────────────────────────────────────────────────────────────
+
+// Apply these as the measure's default Format in the Modeling ribbon
+// rather than wrapping in FORMAT() — FORMAT() converts to text and breaks
+// conditional formatting / sort order in visuals.
+//   Total Budget Used, Budget Allocated, Total Net Value, Deferred Risk Value,
+//   Mandatory Tasks Cost  →  Currency, $#,##0
+//   Budget Utilization %, Tasks Selected %, Risk Score Reduction %,
+//   Mech Hours Utilization %  →  Percentage, 0.0%
+//   ROI Ratio, ROI by Run  →  Decimal Number, 0.00"x"

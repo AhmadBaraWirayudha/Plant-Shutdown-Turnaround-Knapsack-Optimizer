@@ -1,0 +1,40 @@
+# ============================================================
+#  Turnaround Knapsack Optimizer - Python Dependencies
+#  Python 3.11+ recommended
+# ============================================================
+
+# Core data science
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+pyarrow>=14.0.0           # Parquet I/O
+
+# Optimization
+ortools>=9.8.0            # Google OR-Tools CP-SAT solver
+
+# Database / Power BI integration
+sqlalchemy>=2.0.0         # star-schema ORM, swappable to Postgres/MySQL/SQL Server
+
+# Visualization / Reporting
+plotly>=5.18.0            # Interactive charts
+openpyxl>=3.1.0           # Excel export (Power BI feed)
+
+# Configuration & utilities
+python-dotenv>=1.0.0      # .env file support
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Development
+black>=23.0.0
+flake8>=6.0.0
+
+# ------------------------------------------------------------
+# Optional database drivers — install only the one matching
+# your DATABASE_URL target. SQLite needs none (stdlib sqlite3).
+# Not installed by default since most users only need SQLite.
+# ------------------------------------------------------------
+#   psycopg2-binary>=2.9.0   # PostgreSQL  (postgresql+psycopg2://...)
+#   pymysql>=1.1.0           # MySQL       (mysql+pymysql://...)
+#   pyodbc>=5.0.0            # SQL Server / ODBC (mssql+pyodbc://..., or generic ODBC)

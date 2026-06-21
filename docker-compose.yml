@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: turnaround-optimizer:latest
+    container_name: turnaround-optimizer
+    command: ["--budget", "5000000", "--turnaround-date", "2026-10-01"]
+    volumes:
+      - ./data/raw:/app/data/raw
+      - ./data/processed:/app/data/processed
+      - ./reports:/app/reports
+      - ./dashboard:/app/dashboard
+    environment:
+      - TA_BUDGET=5000000
+      - TA_DATE=2026-10-01
+      - SOLVER_TIMEOUT_S=120
+      - SOLVER_WORKERS=4

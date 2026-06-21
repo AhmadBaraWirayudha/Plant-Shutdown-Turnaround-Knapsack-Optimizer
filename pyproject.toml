@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turnaround-knapsack-optimizer"
+version = "1.0.0"
+description = "0-1 ILP knapsack optimizer for plant shutdown/turnaround CMMS work-order scheduling under budget and craft-hour constraints, with Weibull reliability analysis and risk-based prioritization."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Reliability Engineering" }]
+keywords = [
+    "operations-research", "ilp", "knapsack", "or-tools",
+    "weibull", "reliability", "cmms", "turnaround", "maintenance-optimization",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "ignore::scipy.optimize.OptimizeWarning",
+    "ignore::RuntimeWarning:scipy.stats._continuous_distns",
+]
+
+[tool.black]
+line-length = 110
+target-version = ["py311", "py312"]
+include = '\.pyi?$'
+
+[tool.flake8]
+max-line-length = 110
+extend-ignore = ["E203", "W503"]
+exclude = ["__pycache__", ".git", "build", "dist"]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "src/utils/data_generator.py",  # synthetic-data generator, not production decision logic
+    "src/etl/extract.py",            # thin I/O wrappers (CSV/SQL/API) — validated via pipeline smoke test
+    "src/etl/load.py",                # thin Parquet/CSV persistence wrapper
+    "src/main.py",                    # orchestration only — every stage it calls is unit-tested individually
+    "src/reporting/dashboard.py",     # HTML/Plotly rendering I/O — validated via pipeline smoke test
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
