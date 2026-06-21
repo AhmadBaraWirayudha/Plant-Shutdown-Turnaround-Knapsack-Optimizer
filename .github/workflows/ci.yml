@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch: {}
+
+jobs:
+  lint:
+    name: Lint (flake8 + black --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run flake8
+        run: |
+          flake8 src/ tests/ run_optimizer.py \
+            --max-line-length=110 \
+            --extend-ignore=E203,W503 \
+            --exclude=__pycache__
+
+      - name: Run black --check
+        run: black --check --diff src/ tests/ run_optimizer.py
+
+  test:
+    name: Unit Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest with coverage
+        run: |
+          pytest tests/ -v \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=98
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  smoke-test:
+    name: End-to-End Pipeline Smoke Test
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run full pipeline (small synthetic instance, tight timeout)
+        run: |
+          python run_optimizer.py \
+            --regenerate-data \
+            --num-work-orders 100 \
+            --budget 1500000 \
+            --timeout 20 \
+            --seed 99
+
+      - name: Verify outputs were created
+        run: |
+          test -f dashboard/turnaround_dashboard.html
+          test -f reports/power_bi_export.xlsx
+          echo "✅ Pipeline artifacts verified"
+
+      - name: Verify --num-work-orders actually took effect
+        run: |
+          # Regression guard: a prior bug made this flag silently do nothing
+          # (default argument evaluated once at import time — see
+          # docs/METHODOLOGY.md §5). Checking artifact *existence* alone
+          # would never catch that class of bug, since the pipeline still
+          # ran to completion on the wrong row count. Check the actual
+          # row count instead.
+          actual_rows=$(($(wc -l < data/raw/work_orders.csv) - 1))
+          if [ "$actual_rows" -ne 100 ]; then
+            echo "❌ Expected 100 work orders from --num-work-orders 100, got $actual_rows"
+            echo "   This is exactly the bug class documented in docs/METHODOLOGY.md §5."
+            exit 1
+          fi
+          echo "✅ --num-work-orders 100 correctly produced 100 work orders"
+
+  docker-build:
+    name: Docker Build Verification
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: turnaround-optimizer:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
