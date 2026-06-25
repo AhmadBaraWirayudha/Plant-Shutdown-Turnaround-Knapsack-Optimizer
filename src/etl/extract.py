@@ -11,7 +11,9 @@ In production, swap the CSV reader for the appropriate connector.
 
 from __future__ import annotations
 import pandas as pd
+import requests
 from pathlib import Path
+from sqlalchemy import create_engine, text
 
 from src.utils.config import DATA_RAW
 from src.utils.helpers import get_logger, timed
@@ -22,8 +24,18 @@ log = get_logger("etl.extract")
 
 
 @timed
-def load_work_orders(path: Path = DATA_RAW / "work_orders.csv") -> pd.DataFrame:
-    """Read raw CMMS work-order export from CSV."""
+def load_work_orders(path: str | Path | None = None) -> pd.DataFrame:
+    """
+    Read raw CMMS work-order export from CSV.
+
+    `path` defaults to `None`, resolved against `DATA_RAW` inside the
+    function body rather than baked into the signature at import time —
+    see docs/METHODOLOGY.md §5 for why a literal `Path = DATA_RAW / "..."`
+    default here would be the same stale-default-argument bug class found
+    and fixed elsewhere in this codebase, applied here for consistency.
+    """
+    if path is None:
+        path = DATA_RAW / "work_orders.csv"
     log.info("Extracting work orders from %s", path)
     df = pd.read_csv(
         path,
@@ -45,8 +57,10 @@ def load_work_orders(path: Path = DATA_RAW / "work_orders.csv") -> pd.DataFrame:
 
 
 @timed
-def load_asset_master(path: Path = DATA_RAW / "asset_master.csv") -> pd.DataFrame:
+def load_asset_master(path: str | Path | None = None) -> pd.DataFrame:
     """Read asset-master table with Weibull parameters and replacement costs."""
+    if path is None:
+        path = DATA_RAW / "asset_master.csv"
     log.info("Extracting asset master from %s", path)
     df = pd.read_csv(path, dtype={"asset_tag": "string", "asset_class": "string"})
     log.info("  → %d assets", len(df))
@@ -54,8 +68,10 @@ def load_asset_master(path: Path = DATA_RAW / "asset_master.csv") -> pd.DataFram
 
 
 @timed
-def load_failure_history(path: Path = DATA_RAW / "failure_history.csv") -> pd.DataFrame:
+def load_failure_history(path: str | Path | None = None) -> pd.DataFrame:
     """Read historical failure-time records for Weibull fitting."""
+    if path is None:
+        path = DATA_RAW / "failure_history.csv"
     log.info("Extracting failure history from %s", path)
     df = pd.read_csv(
         path,
@@ -80,16 +96,11 @@ def load_from_db(connection_string: str, query: str) -> pd.DataFrame:
             "SELECT * FROM dbo.WorkOrders WHERE Status = 'Planned'"
         )
     """
-    try:
-        from sqlalchemy import create_engine, text
-
-        engine = create_engine(connection_string)
-        with engine.connect() as conn:
-            df = pd.read_sql(text(query), conn)
-        log.info("DB query returned %d rows", len(df))
-        return df
-    except ImportError:
-        raise RuntimeError("sqlalchemy not installed — run: pip install sqlalchemy")
+    engine = create_engine(connection_string)
+    with engine.connect() as conn:
+        df = pd.read_sql(text(query), conn)
+    log.info("DB query returned %d rows", len(df))
+    return df
 
 
 # ─── REST API Extractor (stub) ────────────────────────────────────────────────
@@ -101,8 +112,6 @@ def load_from_api(endpoint: str, token: str | None = None) -> pd.DataFrame:
 
     Swap in the real CMMS vendor API here (SAP PM, Maximo, etc.).
     """
-    import requests
-
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     resp = requests.get(endpoint, headers=headers, timeout=30)
     resp.raise_for_status()

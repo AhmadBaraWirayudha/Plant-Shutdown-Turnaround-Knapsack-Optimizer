@@ -164,13 +164,15 @@ turnaround-optimizer/
 │   │                              #   Excel star-schema, native Postgres/SQL Server
 │   └── measures.dax               # copy-pasteable DAX measures
 │
-├── tests/                         # 151 tests — see Testing below
-│   ├── test_etl.py
+├── tests/                         # 200 tests — see Testing below
+│   ├── test_etl.py                # incl. real SQLite query, mocked REST API
+│   ├── test_load.py               # Parquet/CSV persistence round-trip
 │   ├── test_helpers.py
 │   ├── test_weibull.py
 │   ├── test_risk.py
 │   ├── test_optimizer.py          # constraint-satisfaction proofs
 │   ├── test_export.py             # star-schema Excel sheet builder + real xlsx I/O
+│   ├── test_dashboard.py          # HTML dashboard path-handling
 │   ├── test_db.py                 # schema, transactional writer, multi-run
 │   │                              #   idempotency, real-pipeline integration
 │   └── test_data_generator.py     # RNG threading + config-sentinel regression tests
@@ -237,10 +239,12 @@ subject to  Σ cost_i  · x_i ≤ Budget
 pytest tests/ -v --cov=src --cov-report=term-missing
 ```
 
-151 tests across eight files, all passing, at 99% line coverage on every
-module that contains decision or persistence logic (100% on risk scoring,
-optimization, configuration, helpers, the database layer, and the Excel
-export's star-schema builder). The ones that matter most are in
+200 tests across ten files, all passing, at 99% overall line coverage —
+every single module in `src/` is at genuine 100% (including the ETL
+extraction layer, the Parquet/CSV persistence layer, the HTML dashboard
+renderer, and the Excel export's star-schema builder) except one
+documented 4-line gap in the Weibull fitting fallback (see
+`docs/METHODOLOGY.md` §7). The ones that matter most are in
 `tests/test_optimizer.py`: rather than checking one example problem, they
 run the solver across 10+ random seeds and problem sizes (scaling up to 600
 tasks) and assert, every time:
@@ -255,30 +259,27 @@ tasks) and assert, every time:
   (a real bug caught during development — see `docs/METHODOLOGY.md` §3.3
   and the git history for the fix)
 
-Nine more real bugs were caught by writing this suite, and by actually
-diffing CLI output rather than just checking for exceptions: an artificial
-$5M "mandatory bonus" that was silently inflating every ROI metric by ~50×
-(§2.4 of the methodology doc), an `np.inf` value that survived an input
-filter and corrupted both the primary Weibull fit and its fallback
-calculation (§1.3), a SQLAlchemy `scalars()` misuse in the database writer
-that was completely invisible on a database's first write and only
-surfaced once a second run gave it existing rows to iterate over (§4.2),
-three CLI flags — `--horizon-days`, `--num-work-orders`, and `--seed` —
-that looked like they worked (no errors, config correctly mutated) but
-were silently ignored downstream due to Python's classic "default argument
-evaluated once at import time" trap (§5), and three more found by
-deliberately feeding the CLI unusual input: `--num-work-orders 0` crashed
-with a confusing `KeyError` deep inside pandas instead of a clear
-validation message, a negative `--seed` surfaced numpy's raw internal
-error text instead of an application-level one, and CP-SAT's `INFEASIBLE`
-and `UNKNOWN` solver statuses shared one error message that always blamed
-the budget — actively wrong for `UNKNOWN`, which means the solver ran out
-of time before concluding anything, not that no solution exists (§6). The
-override-related bugs were found by running the actual CLI twice with
-different flag values and diffing the output CSVs byte-for-byte —
-confirming the override genuinely changed nothing is a much stronger check
-than confirming the command didn't crash. All have dedicated regression
-tests.
+Twenty more real bugs were caught by writing this suite — not just
+checking for exceptions, but diffing CLI output byte-for-byte and
+inspecting actual computed values. A representative sample: an artificial
+$5M "mandatory bonus" silently inflating every ROI metric by ~50× (§2.4 of
+the methodology doc); three CLI flags (`--horizon-days`,
+`--num-work-orders`, `--seed`) that looked like they worked — no errors,
+config correctly mutated — but were silently ignored downstream due to
+Python's classic "default argument evaluated once at import time" trap
+(§5); any craft-hour cap or the budget set to exactly `0` crashing the
+solver with an unhandled `ZeroDivisionError` (§6); a JSON audit log that
+didn't crash but silently corrupted type fidelity — `np.bool_(False)` became
+the *truthy* string `"False"` on reload (§6); three distinct concurrency
+races that crashed or silently lost data when two threads wrote to the
+database simultaneously (§4.5); and two security vulnerabilities — the
+HTML dashboard interpolated user-controlled strings directly into the
+template without `html.escape()` (XSS via a CMMS description containing
+`<script>`), and the Excel export wrote formula-trigger values verbatim
+so a work-order whose `wo_id` started with `=` would execute as a
+spreadsheet formula when opened (Excel formula injection, OWASP-listed).
+The full list is in `docs/METHODOLOGY.md` §1–§6. Every one has a
+dedicated regression test.
 
 ## Database & Power BI Integration
 

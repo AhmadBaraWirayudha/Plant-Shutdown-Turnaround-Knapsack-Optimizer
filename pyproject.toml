@@ -40,10 +40,7 @@ exclude = ["__pycache__", ".git", "build", "dist"]
 source = ["src"]
 omit = [
     "src/utils/data_generator.py",  # synthetic-data generator, not production decision logic
-    "src/etl/extract.py",            # thin I/O wrappers (CSV/SQL/API) — validated via pipeline smoke test
-    "src/etl/load.py",                # thin Parquet/CSV persistence wrapper
     "src/main.py",                    # orchestration only — every stage it calls is unit-tested individually
-    "src/reporting/dashboard.py",     # HTML/Plotly rendering I/O — validated via pipeline smoke test
 ]
 
 [tool.coverage.report]

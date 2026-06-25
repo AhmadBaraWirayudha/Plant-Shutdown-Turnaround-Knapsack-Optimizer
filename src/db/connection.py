@@ -51,10 +51,15 @@ def get_engine(database_url: str | None = None, echo: bool = False) -> Engine:
     """
     Create a SQLAlchemy engine for the resolved database URL.
 
-    For SQLite specifically, enables foreign-key enforcement (OFF by default
-    in SQLite, unlike every other engine this code supports) so that the
-    referential-integrity guarantees in schema.py are actually enforced
-    rather than silently accepted and ignored.
+    For SQLite specifically:
+    - Enables foreign-key enforcement (OFF by default in SQLite, unlike
+      every other engine this code supports) so that the referential-
+      integrity guarantees in schema.py are actually enforced rather than
+      silently accepted and ignored.
+    - Sets busy_timeout to 30 s (default is 5 s, which is too short when
+      multiple threads or processes compete for the write lock during a
+      concurrent scenario sweep — they would otherwise immediately raise
+      OperationalError: database is locked).
     """
     url = get_database_url(database_url)
     engine = create_engine(url, echo=echo, future=True)
@@ -62,9 +67,10 @@ def get_engine(database_url: str | None = None, echo: bool = False) -> Engine:
     if url.startswith("sqlite"):
 
         @event.listens_for(engine, "connect")
-        def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+        def _configure_sqlite(dbapi_connection, _connection_record):
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA busy_timeout=30000")  # milliseconds
             cursor.close()
 
     log.info("Database engine ready → %s", _redact(url))

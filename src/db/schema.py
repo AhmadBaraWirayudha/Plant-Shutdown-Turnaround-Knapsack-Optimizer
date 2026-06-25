@@ -174,7 +174,7 @@ class FactWorkOrderDecision(Base):
     risk_level_id: Mapped[int] = mapped_column(ForeignKey("dim_risk_level.risk_level_id"))
 
     wo_id: Mapped[str] = mapped_column(String(20))
-    description: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(String(500))
     predecessor_wo_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
     mandatory: Mapped[bool] = mapped_column(Boolean)
 

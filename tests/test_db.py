@@ -125,20 +125,22 @@ def _make_schedule(n=10, seed=0) -> pd.DataFrame:
 
 def _make_summary(schedule: pd.DataFrame, budget: float = 100_000.0) -> dict:
     sel = schedule[schedule["selected"]]
+    budget_used = float(sel.estimated_cost_usd.sum())
+    net_value = float(sel.net_value_usd.sum())
     return {
         "solver_status": "OPTIMAL",
         "solve_time_s": 0.05,
         "tasks_total": len(schedule),
         "tasks_selected": int(sel.shape[0]),
         "budget_usd": budget,
-        "budget_used_usd": float(sel.estimated_cost_usd.sum()),
-        "budget_utilisation": float(sel.estimated_cost_usd.sum()) / budget,
+        "budget_used_usd": round(budget_used, 2),
+        "budget_utilisation": round(budget_used / budget if budget > 0 else 0.0, 4),
         "max_mech_hours": 1000.0,
         "max_elec_hours": 500.0,
         "max_inst_hours": 500.0,
         "max_civil_hours": 200.0,
-        "total_net_value_usd": float(sel.net_value_usd.sum()),
-        "roi_ratio": float(sel.net_value_usd.sum()) / max(float(sel.estimated_cost_usd.sum()), 1),
+        "total_net_value_usd": round(net_value, 2),
+        "roi_ratio": round(net_value / budget_used if budget_used > 0 else 0.0, 4),
         "total_risk_score_reduced": int(sel.risk_score.sum()),
     }
 
@@ -211,6 +213,19 @@ class TestSchemaCreation:
         init_db(temp_engine)
         init_db(temp_engine)  # must not raise on a table that already exists
 
+    def test_sqlite_pragmas_are_configured(self, temp_engine):
+        """Both foreign_keys and busy_timeout PRAGMAs must be set on every
+        SQLite connection — foreign_keys for data integrity, busy_timeout
+        to prevent OperationalError under concurrent write load."""
+        from sqlalchemy import text as sa_text
+
+        with temp_engine.connect() as conn:
+            fk = conn.execute(sa_text("PRAGMA foreign_keys")).scalar()
+            bt = conn.execute(sa_text("PRAGMA busy_timeout")).scalar()
+
+        assert fk == 1, "PRAGMA foreign_keys must be ON (1)"
+        assert bt == 30000, "PRAGMA busy_timeout must be 30000 ms"
+
     def test_foreign_keys_enforced_on_sqlite(self, temp_engine):
         """SQLite has FK enforcement OFF by default — connection.py must
         turn it on, or invalid fact rows would be silently accepted."""
@@ -252,6 +267,68 @@ class TestWriteResultsToDb:
         result = _FakeResult(schedule, summary)
         run_id = write_results_to_db(temp_engine, result, _FakeTaCfg())
         assert fact_row_count(temp_engine, run_id=run_id) == 15
+
+    def test_description_under_limit_is_preserved_exactly(self, temp_engine):
+        schedule = _make_schedule(n=1)
+        schedule.loc[0, "description"] = "A short, normal work order description"
+        summary = _make_summary(schedule)
+        result = _FakeResult(schedule, summary)
+        run_id = write_results_to_db(temp_engine, result, _FakeTaCfg())
+        facts = get_run_facts(temp_engine, run_id)
+        assert facts.iloc[0]["description"] == "A short, normal work order description"
+
+    def test_description_over_limit_is_truncated_not_crashed(self, temp_engine):
+        """
+        Regression test: a real-world CMMS description longer than the
+        database column's String(500) limit must not crash the whole
+        transaction — it gets truncated, which is necessary for
+        cross-database VARCHAR-length compatibility (Postgres/MySQL/SQL
+        Server enforce the declared length; SQLite doesn't, so this must
+        be tested explicitly rather than relying on the DB to catch it).
+        """
+        schedule = _make_schedule(n=1)
+        long_description = "X" * 600  # exceeds the 500-char column limit
+        schedule.loc[0, "description"] = long_description
+        summary = _make_summary(schedule)
+        result = _FakeResult(schedule, summary)
+
+        run_id = write_results_to_db(temp_engine, result, _FakeTaCfg())  # must not raise
+
+        facts = get_run_facts(temp_engine, run_id)
+        stored = facts.iloc[0]["description"]
+        assert len(stored) == 500
+        assert stored == long_description[:500]
+
+    def test_description_truncation_logs_a_warning(self, temp_engine, caplog):
+        """
+        Regression test for a real bug: descriptions longer than the
+        column limit used to be silently sliced with no indication
+        anything was lost — a real CMMS user with verbose free-text
+        descriptions would have no idea their data was being cut off.
+        """
+        import logging
+
+        schedule = _make_schedule(n=1)
+        schedule.loc[0, "description"] = "Y" * 600
+        summary = _make_summary(schedule)
+        result = _FakeResult(schedule, summary)
+
+        with caplog.at_level(logging.WARNING):
+            write_results_to_db(temp_engine, result, _FakeTaCfg())
+
+        assert any("truncated" in record.message for record in caplog.records)
+
+    def test_no_warning_when_nothing_is_truncated(self, temp_engine, caplog):
+        import logging
+
+        schedule = _make_schedule(n=5)  # default short descriptions
+        summary = _make_summary(schedule)
+        result = _FakeResult(schedule, summary)
+
+        with caplog.at_level(logging.WARNING):
+            write_results_to_db(temp_engine, result, _FakeTaCfg())
+
+        assert not any("truncated" in record.message for record in caplog.records)
 
     def test_dim_asset_does_not_duplicate_across_runs(self, temp_engine):
         """Regression test for the session.scalars() AttributeError bug:
@@ -339,6 +416,113 @@ class TestWriteResultsToDb:
 
 
 # ─── Query helper tests ─────────────────────────────────────────────────────────
+
+
+class TestConcurrentWrites:
+    """
+    Regression tests for a real, confirmed concurrency bug: each upsert
+    function used the classic TOCTOU (time-of-check to time-of-use)
+    pattern — SELECT existing rows, then INSERT if not found. Two concurrent
+    writers can both see a lookup value as absent and both try to insert it.
+    The UNIQUE constraint correctly prevents the duplicate at the DB level,
+    but the application code previously let the IntegrityError propagate and
+    abort the ENTIRE outer transaction, losing that writer's whole run.
+
+    The fix: _insert_or_recover() wraps each insert in a SAVEPOINT (nested
+    transaction). On IntegrityError it rolls back just the savepoint, then
+    re-queries to get the row that the winning writer already inserted —
+    the outer transaction stays alive. SAVEPOINT is standard SQL and works
+    identically across SQLite, Postgres, MySQL, and SQL Server.
+    """
+
+    @staticmethod
+    def _make_schedule(seed=0):
+        return _make_schedule(n=10, seed=seed)
+
+    def test_sequential_writes_of_identical_lookup_values_do_not_duplicate(self, temp_engine):
+        """Baseline: the non-concurrent path must still work without error."""
+        s1 = self._make_schedule(seed=0)
+        s2 = self._make_schedule(seed=1)
+        r1 = _FakeResult(s1, _make_summary(s1))
+        r2 = _FakeResult(s2, _make_summary(s2))
+        write_results_to_db(temp_engine, r1, _FakeTaCfg())
+        write_results_to_db(temp_engine, r2, _FakeTaCfg())
+
+        from src.db.schema import DimTaskType
+        from sqlalchemy import select as sa_select
+
+        with temp_engine.connect() as conn:
+            task_types = conn.execute(sa_select(DimTaskType)).fetchall()
+        # Both schedules share the same task_type values — must not duplicate
+        task_type_names = [r.task_type_name for r in task_types]
+        assert len(task_type_names) == len(set(task_type_names))
+
+    def test_concurrent_writes_all_land_without_error(self, temp_engine):
+        """
+        5 threads each writing 3 runs must all succeed — the SAVEPOINT fix
+        ensures a UNIQUE constraint race does not abort the outer
+        transaction. Exactly 15 runs and 150 fact rows must appear.
+        """
+        import threading
+
+        errors = []
+
+        def worker(thread_id):
+            try:
+                for j in range(3):
+                    schedule = _make_schedule(n=10, seed=thread_id * 10 + j)
+                    result = _FakeResult(schedule, _make_summary(schedule))
+                    write_results_to_db(
+                        temp_engine, result, _FakeTaCfg(), run_label=f"Thread-{thread_id}-Run-{j}"
+                    )
+            except Exception as exc:
+                errors.append((thread_id, type(exc).__name__, str(exc)[:120]))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Concurrent write errors: {errors}"
+        assert fact_row_count(temp_engine) == 150  # 5 threads × 3 runs × 10 WOs
+        assert len(list_runs(temp_engine)) == 15
+
+    def test_concurrent_writes_produce_no_duplicate_lookup_values(self, temp_engine):
+        """Even after a race, dim_task_type/dim_priority/dim_risk_level must
+        have exactly one row per distinct value — no duplicates from the
+        concurrent inserts before the SAVEPOINT fix."""
+        import threading
+        from sqlalchemy import select as sa_select
+        from src.db.schema import DimTaskType, DimPriority, DimRiskLevel
+
+        def worker(i):
+            schedule = _make_schedule(n=10, seed=i)
+            result = _FakeResult(schedule, _make_summary(schedule))
+            try:
+                write_results_to_db(temp_engine, result, _FakeTaCfg())
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Map each model to its name attribute — using named access rather
+        # than r[1] position, which would silently break if a new column
+        # were ever added before the name column in any of these models.
+        name_attr = {
+            DimTaskType: "task_type_name",
+            DimPriority: "priority_name",
+            DimRiskLevel: "risk_level_name",
+        }
+        with temp_engine.connect() as conn:
+            for model in (DimTaskType, DimPriority, DimRiskLevel):
+                rows = conn.execute(sa_select(model)).fetchall()
+                names = [getattr(r, name_attr[model]) for r in rows]
+                assert len(names) == len(set(names)), f"{model.__tablename__} has duplicate entries: {names}"
 
 
 class TestQueryHelpers:

@@ -275,6 +275,68 @@ mid-transaction, and a direct SQLite inspection afterward confirmed
 counts — zero partial rows, zero corruption — before the fix was applied
 and the same scenarios were re-run successfully.
 
+### 4.4 Silent truncation of long descriptions
+
+`fact_work_order_decision.description` is a `String(500)` column —
+necessary because Postgres/MySQL/SQL Server all strictly enforce declared
+VARCHAR lengths (SQLite, notably, does not, which is exactly why this
+needs to be tested explicitly against the actual column constraint rather
+than just trusting SQLite to catch it). The writer used to silently slice
+any longer description to fit, with zero indication anything was cut. The
+synthetic data generator's descriptions max out around 40 characters, so
+this never triggered for the shipped demo data — but the codebase
+explicitly documents "Connecting real CMMS data" as a supported path
+(README), and real-world CMMS free-text description fields routinely
+carry technician notes well past 500 characters. `_insert_fact_rows()` now
+logs a warning naming exactly how many descriptions were truncated
+whenever it actually happens, so a real user gets visibility into the data
+loss instead of a silently-clipped database column — the full,
+untruncated text remains available regardless, in the Excel export and
+HTML dashboard, neither of which has a length limit.
+
+### 4.5 Concurrent write safety
+
+Three distinct races in the database writer were found by running five
+threads simultaneously against the same database file — a realistic
+scenario for a small team running budget scenarios in parallel:
+
+**`init_db()` TABLE ALREADY EXISTS race**: `Base.metadata.create_all()`
+uses `checkfirst=True` internally but that is still a SELECT-then-CREATE
+sequence; two threads racing through it can both see a table as absent and
+both issue `CREATE TABLE dim_run`, producing an `OperationalError: table
+already exists` before either could write anything. Fixed with a
+`threading.Lock` at the module level, making `init_db()` genuinely atomic.
+
+**Lookup-table upsert TOCTOU race**: Every "SELECT to check if row exists,
+then INSERT if not found" upsert in `_upsert_lookup_task_types()` and its
+siblings is a classic time-of-check-to-time-of-use race. Two concurrent
+writers can both see a lookup value as absent and both attempt to insert it;
+the UNIQUE constraint correctly prevents the duplicate, but the application
+code previously let the resulting `IntegrityError` propagate and abort the
+**entire outer transaction**, losing that writer's whole run. Fixed with
+`_insert_or_recover()`, which wraps each insert in a `SAVEPOINT` (standard
+SQL, supported across all four target backends). On `IntegrityError` it
+rolls back just the savepoint, then re-queries to get the row the winning
+writer already inserted — the outer transaction stays alive.
+
+**`_create_latest_run_view()` DROP+CREATE race**: The view was recreated
+outside the main transaction via its own `engine.begin()`. Two threads can
+race through the DROP-then-CREATE sequence — thread A drops the view,
+thread B also successfully drops it (already gone), thread B creates it,
+thread A tries to create it and finds it already exists. Fixed by wrapping
+the SQLite-dialect DROP+CREATE in a SAVEPOINT so only the inner savepoint
+is lost on collision, and using `CREATE OR REPLACE VIEW` on
+Postgres/MySQL/SQL Server (which support it natively).
+
+**SQLite busy_timeout**: SQLite has a file-level write lock, and its
+default 5-second timeout produced `OperationalError: database is locked`
+under heavy concurrent load before the per-connection SAVEPOINT fix
+reduced contention. The `busy_timeout` PRAGMA is now set to 30 seconds in
+the SQLite event listener alongside `foreign_keys=ON`, giving reasonable
+headroom for concurrent scenario sweeps. This is a SQLite-specific
+mitigation — Postgres and SQL Server implement row-level locking and do not
+have the same single-writer file-lock limitation.
+
 ## 5. CLI Overrides & the Stale-Default-Argument Bug Class
 
 ### 5.1 The bug, found by actually running the CLI twice
@@ -405,6 +467,99 @@ become actively contradictory for the `UNKNOWN` case (the error message
 explicitly says "this does NOT mean your constraints are infeasible,"
 immediately followed by a footer recommending budget/hours fixes anyway).
 
+**Any of `total_budget`, `max_mech_hours`, `max_elec_hours`,
+`max_inst_hours`, or `max_civil_hours` set to `0`** — a legitimate
+configuration (a turnaround with genuinely no planned civil-craft work,
+for instance) — crashed `_extract_results()` with an unhandled
+`ZeroDivisionError` while computing the utilisation percentage, before the
+solver even returned a result. A 0-capacity trade forces the matching
+constraint `Σ hours_i · x_i ≤ 0`, which in turn forces `used` to also be
+exactly 0 for any feasible solve, so 0/0 here always genuinely means
+"0% utilised" rather than an undefined edge case. A `_safe_ratio()` helper
+now returns that 0.0 directly instead of dividing. While fixing this, a
+second, more subtle bug in the same code surfaced: the old `roi_ratio`
+calculation guarded its own division by `max(budget_used, 1)` rather than
+checking for zero — which doesn't crash, but when `budget_used` is
+genuinely 0, silently returns the raw dollar value of `total_value`
+mislabeled as a "ratio" (e.g. `roi_ratio == 5000.0` meaning $5,000, not
+5000×). Both are now unified under the same `_safe_ratio()` helper.
+
+**`export_to_excel()` and `generate_dashboard()`'s `out_path` parameters**
+crashed with `AttributeError: 'str' object has no attribute 'parent'` if
+a caller passed a plain string rather than a `pathlib.Path` — a completely
+natural thing to do, since most file-path-accepting Python APIs are
+duck-typed to accept either. Every test written for these two functions
+up to that point had used the `tmp_path` pytest fixture, which always
+yields a `Path`, so the gap was invisible despite 100% line coverage on
+both files — a reminder that line coverage proves a line executed, not
+that every realistic *input type* to that line was exercised. Both
+parameters now coerce their input via `Path(out_path)`, and both also had
+the same stale-default-argument pattern as the rest of §5
+(`out_path: Path = REPORTS_DIR / "..."`, evaluated once at import time) —
+fixed with the same `None`-sentinel pattern, alongside the same fix
+applied to `load_work_orders`/`load_asset_master`/`load_failure_history`'s
+`DATA_RAW`-derived defaults for full consistency, even though nothing
+currently mutates `DATA_RAW`/`REPORTS_DIR`/`DASHBOARD_DIR` after import.
+
+**`load_from_api()` imported `requests`**, a library never declared in
+`requirements.txt` at all. The function is a real, documented extension
+point (see "Connecting real CMMS data" in the README), not hypothetical
+pseudocode, so a fresh `pip install -r requirements.txt` followed by an
+attempt to actually use it would fail with an `ImportError` nowhere
+mentioned in the dependency list. Added `requests` as a declared
+dependency, moved it (and `sqlalchemy`, similarly previously
+function-local "in case it's not installed" despite being a hard
+requirement everywhere else in this codebase) to proper module-level
+imports, and added both to the Docker healthcheck's import list alongside
+the rest of the genuinely-required dependencies.
+
+**The JSON audit log silently corrupted numeric and boolean type
+fidelity.** `write_run_log()`'s `json.dump(..., default=str)` looks
+harmless — it doesn't crash on anything — but numpy scalar types
+(`np.int64`, `np.float64`, `np.bool_`, all extremely common in any dict
+built from pandas/numpy reductions like `.sum()`/`.mean()`) aren't natively
+JSON-serializable, so the `default=str` fallback silently stringified
+them: `np.int64(222)` became the JSON string `"222"` rather than the
+number `222`. Far more dangerously, `np.bool_(False)` became the string
+`"False"` — which is **truthy** when reloaded and tested with `if value:`
+in Python, silently inverting the original boolean's meaning for any
+downstream consumer of the audit trail. In current usage this never
+actually triggered, since `solver.py`'s summary dict is already
+disciplined about casting every value to a native Python type before it
+reaches the audit log — but `write_run_log()` is a general-purpose utility
+that was safe only by accident, not by design, the moment any future
+caller passed unconverted pandas/numpy output. A custom `default` hook now
+converts numpy scalars via `.item()` first (preserving the correct JSON
+type) and only falls back to `str()` for genuinely non-serializable
+objects like `Path`.
+
+it reports and is visible only to the reader as ordinary text with no
+formula side effects.
+
+**Dashboard HTML rendered user-controlled strings without escaping.**
+`_build_table_rows()` interpolated `wo_id`, `asset_tag`, `area`,
+`task_type`, `priority`, `decision`, and `risk_level` directly into the
+HTML string with no `html.escape()` call. A real CMMS work-order whose
+`area` field happened to contain `</td><script>alert("xss")</script>`
+would execute as JavaScript in any browser opening the dashboard — not a
+theoretical risk, since CMMS description and area fields are free-text
+that operators edit directly. Every string column is now passed through
+`html.escape()` before interpolation, and a dedicated regression test
+injects a `<script>` tag and asserts it appears as `&lt;script&gt;` in
+the output, not as executable markup.
+
+**Excel spreadsheets rendered user-controlled strings without escaping.**
+The classic "CSV/spreadsheet formula injection" vulnerability
+(OWASP-listed): `openpyxl` writes string cell values verbatim, and Excel
+treats any value beginning with `=`, `+`, `-`, or `@` as a formula to
+execute. A work-order `wo_id` of `=HYPERLINK("http://evil.com","click")`
+would silently open a browser window — or, with DDE formulas, execute
+arbitrary commands — when the exported workbook was opened. A
+`_sanitise_formula_injection()` helper now prefixes any formula-starting
+value with a single apostrophe (Excel's conventional "treat as plain
+text" escape, invisible to the reader) before every DataFrame is written
+to the workbook.
+
 ## 7. Validation Philosophy
 
 Every constraint in §3.3 has a dedicated property-based test in
@@ -415,15 +570,16 @@ includes mandatory safety tasks, is more dangerous than no tool at all,
 because it will be trusted. The test suite exists to make "usually" into
 "always, or it raises loudly."
 
-The suite reaches 99% line coverage on every module that contains decision
-logic or persistence logic (100% on risk scoring, optimization,
-configuration, helpers, the database layer, and the Excel export's
-star-schema builder; 96% on the Weibull module). The remaining 4 lines are
-the innermost defensive branch in `fit_weibull` — the case where scipy's
-MLE returns a non-finite or non-positive shape/scale *despite* receiving
-≥3 finite, positive observations. That branch is real and intentional (it
-guards against a genuine, if rare, numerical-optimizer failure mode), but
-reliably forcing scipy's internals into that state requires mocking rather
-than constructing realistic adversarial data, which was judged not worth
-the resulting test fragility. It's documented here rather than hidden
-behind an inflated coverage number.
+The suite reaches 99% overall line coverage, with every single module in
+`src/` at genuine 100% — including the ETL extraction layer (CSV loaders,
+a real SQLAlchemy query against a local SQLite engine, and a mocked REST
+API client), the Parquet/CSV persistence layer, the HTML dashboard
+renderer, and the Excel export's star-schema builder — except one 4-line
+gap in `fit_weibull`. That gap is the innermost defensive branch — the
+case where scipy's MLE returns a non-finite or non-positive shape/scale
+*despite* receiving ≥3 finite, positive observations. That branch is real
+and intentional (it guards against a genuine, if rare, numerical-optimizer
+failure mode), but reliably forcing scipy's internals into that state
+requires mocking rather than constructing realistic adversarial data,
+which was judged not worth the resulting test fragility. It's documented
+here rather than hidden behind an inflated coverage number.

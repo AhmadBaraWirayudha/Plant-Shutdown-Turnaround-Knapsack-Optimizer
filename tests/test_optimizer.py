@@ -142,6 +142,59 @@ class TestMandatoryConstraint:
             TurnaroundSolver(wos, config=cfg).solve()
 
 
+class TestZeroCapacityTradeDoesNotCrash:
+    """
+    Regression tests for a real bug: setting any of total_budget,
+    max_mech_hours, max_elec_hours, max_inst_hours, or max_civil_hours to
+    0 (a legitimate configuration — e.g. a turnaround with no planned
+    civil-craft work at all) used to crash `_extract_results()` with an
+    unhandled ZeroDivisionError, before the solver even returned a result.
+    `_safe_ratio()` now returns 0.0 utilisation instead, which is the
+    mathematically correct value here: a 0-capacity trade with the
+    corresponding constraint `Σ hours_i · x_i ≤ 0` forces `used` to also
+    be exactly 0 for any feasible solve, so 0/0 genuinely means 0% used.
+    """
+
+    def test_zero_civil_hours_cap_does_not_crash(self):
+        wos = _make_wos(n=10, seed=1)
+        wos["civil_hours"] = 0.0  # no task in this backlog needs civil craft
+        cfg = _Cfg(total_budget=100_000.0, max_civil_hours=0.0)
+        result = TurnaroundSolver(wos, config=cfg).solve()
+        assert result.summary["civil_utilisation"] == 0.0
+        assert result.summary["civil_hours_used"] == 0.0
+
+    def test_zero_elec_hours_cap_does_not_crash(self):
+        wos = _make_wos(n=10, seed=1)
+        wos["elec_hours"] = 0.0
+        cfg = _Cfg(total_budget=100_000.0, max_elec_hours=0.0)
+        result = TurnaroundSolver(wos, config=cfg).solve()
+        assert result.summary["elec_utilisation"] == 0.0
+
+    def test_zero_budget_does_not_crash_when_no_mandatory_tasks(self):
+        """Zero budget with zero mandatory tasks is feasible (select
+        nothing) and must report 0% budget utilisation, not crash."""
+        wos = _make_wos(n=10, seed=1)
+        cfg = _Cfg(total_budget=0.0)
+        result = TurnaroundSolver(wos, config=cfg).solve()
+        assert result.summary["budget_utilisation"] == 0.0
+        assert result.summary["tasks_selected"] == 0
+
+    def test_roi_ratio_is_zero_not_raw_dollars_when_nothing_selected(self):
+        """
+        Regression test for a second, related bug in the OLD code: when
+        budget_used was 0, the previous `total_value / max(budget_used, 1)`
+        formula divided by 1 instead of 0 — which doesn't crash, but
+        silently returns the raw dollar value of total_value mislabeled as
+        a "ratio" (e.g. roi_ratio == 5000.0 meaning $5000, not 5000x).
+        Since nothing was selected, total_value is also 0 here, so the
+        correct, unambiguous ratio is 0.0.
+        """
+        wos = _make_wos(n=10, seed=1)
+        cfg = _Cfg(total_budget=0.0)
+        result = TurnaroundSolver(wos, config=cfg).solve()
+        assert result.summary["roi_ratio"] == 0.0
+
+
 class TestUnknownVsInfeasibleErrorMessages:
     """
     Regression tests for a real bug: CP-SAT's INFEASIBLE status (a

@@ -55,7 +55,7 @@ USER optimizer
 
 # Healthcheck: confirm every hard dependency imports cleanly (catches dependency rot)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s \
-    CMD python -c "import ortools, pandas, numpy, scipy, pyarrow, sqlalchemy, plotly, openpyxl, dotenv" || exit 1
+    CMD python -c "import ortools, pandas, numpy, scipy, pyarrow, sqlalchemy, plotly, openpyxl, dotenv, requests" || exit 1
 
 ENTRYPOINT ["python", "run_optimizer.py"]
 CMD ["--budget", "5000000"]

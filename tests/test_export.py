@@ -1,10 +1,11 @@
 """
-test_export.py — Tests for the star-schema mirror sheets built for the
-Excel/Power BI export (the pure-logic part of export.py; the actual
-openpyxl file-writing is covered by the pipeline smoke test instead).
+test_export.py — Tests for export_to_excel() and its star-schema mirror
+sheet builder, including direct end-to-end tests of the actual openpyxl
+file-writing (not just the pure-logic dimension-table construction).
 """
 
 from __future__ import annotations
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -182,9 +183,104 @@ class TestExportToExcelEndToEnd:
         export_to_excel(result, out_path=nested_path)
         assert nested_path.exists()
 
+    def test_accepts_plain_string_path_not_just_path_object(self, tmp_path):
+        """
+        Regression test for a real bug: passing a plain str (rather than a
+        pathlib.Path) used to crash with
+        'AttributeError: str object has no attribute parent' the moment
+        out_path.parent.mkdir(...) ran — a bug invisible to every prior
+        test in this file because they all used the tmp_path fixture
+        (which yields Path objects), never a bare string. Passing a string
+        is completely natural for any caller, so this is now coerced
+        internally.
+        """
+        str_path = str(tmp_path / "string_path_export.xlsx")
+        result = self._make_real_result(n=5)
+        returned = export_to_excel(result, out_path=str_path)
+        assert returned == Path(str_path)
+        assert Path(str_path).exists()
+
+    def test_omitted_out_path_resolves_live_reports_dir(self, monkeypatch, tmp_path):
+        """The out_path=None sentinel must resolve REPORTS_DIR at CALL
+        time, not whatever it was when this module was first imported —
+        same bug class as docs/METHODOLOGY.md §5."""
+        import src.reporting.export as export_mod
+
+        monkeypatch.setattr(export_mod, "REPORTS_DIR", tmp_path)
+        result = self._make_real_result(n=5)
+        returned = export_to_excel(result)
+        assert returned == tmp_path / "power_bi_export.xlsx"
+        assert returned.exists()
+
+
+class TestFormulaInjectionSanitisation:
+    """
+    Regression tests for an OWASP-listed vulnerability: 'CSV/Excel formula
+    injection'. User-controlled string fields (wo_id, description, area,
+    task_type, etc.) from a real CMMS can contain values that start with
+    '=', '+', '-', '@' — characters Excel treats as formula triggers. If
+    written to a cell verbatim, these execute as Excel formulas when the
+    workbook is opened, potentially calling HYPERLINK(), DDE(), or other
+    dangerous functions. The _sanitise_formula_injection() helper prefixes
+    such values with a single apostrophe (Excel's 'treat as plain text'
+    escape), which is invisible to the reader but prevents execution.
+    """
+
+    def test_sanitise_escapes_equals_prefix(self):
+        from src.reporting.export import _sanitise_formula_injection
+
+        df = pd.DataFrame({"wo_id": ["=SUM(A1:A10)", "WO-001"]})
+        out = _sanitise_formula_injection(df)
+        assert out.loc[0, "wo_id"] == "'=SUM(A1:A10)"
+        assert out.loc[1, "wo_id"] == "WO-001"  # safe value unchanged
+
+    def test_sanitise_escapes_all_formula_trigger_chars(self):
+        from src.reporting.export import _sanitise_formula_injection
+
+        triggers = {
+            "=": '=HYPERLINK("http://evil.com")',
+            "+": "+SUM(A1)",
+            "-": "-2+3",
+            "@": "@SUM(A1)",
+        }
+        for prefix, val in triggers.items():
+            df = pd.DataFrame({"col": [val]})
+            out = _sanitise_formula_injection(df)
+            assert out.loc[0, "col"] == f"'{val}", f"Value starting with '{prefix}' was not escaped"
+
+    def test_sanitise_leaves_numeric_columns_unchanged(self):
+        """Numbers are never formula-injectable through openpyxl — only
+        string columns need escaping."""
+        from src.reporting.export import _sanitise_formula_injection
+
+        df = pd.DataFrame({"cost": [1000.0, 2000.0], "label": ["=BAD", "ok"]})
+        out = _sanitise_formula_injection(df)
+        assert list(out["cost"]) == [1000.0, 2000.0]  # unchanged
+        assert out.loc[0, "label"] == "'=BAD"
+
+    def test_excel_export_sanitises_formula_injection_in_wo_id(self, tmp_path):
+        """End-to-end: a wo_id starting with '=' must arrive in the Excel
+        file with the apostrophe prefix, preventing formula execution."""
+        import openpyxl
+
+        result = TestExportToExcelEndToEnd._make_real_result(n=5)
+        result.schedule.loc[0, "wo_id"] = '=HYPERLINK("http://evil.com","click")'
+        result.selected_schedule = result.schedule[result.schedule["selected"]].copy()
+        result.deferred_schedule = result.schedule[~result.schedule["selected"]].copy()
+
+        out_path = tmp_path / "injection_test.xlsx"
+        export_to_excel(result, out_path=out_path)
+
+        wb = openpyxl.load_workbook(out_path)
+        ws = wb["OptimizedSchedule"]
+        # Find the injected value in the wo_id column (first column)
+        wo_ids = [ws.cell(row=r, column=1).value for r in range(2, ws.max_row + 1)]
+        for val in wo_ids:
+            if val and "HYPERLINK" in str(val):
+                assert str(val).startswith("'"), f"Formula injection NOT escaped in Excel: {val!r}"
+
 
 class TestBuildDimensionSheets:
-
     def test_returns_all_five_expected_sheets(self):
         sched = _make_schedule()
         sheets = _build_dimension_sheets(sched)

@@ -609,12 +609,25 @@ function sortTable(col) {{
 
 
 def _build_table_rows(sched: pd.DataFrame, max_rows: int = 250) -> str:
-    """Render HTML table rows for the top `max_rows` tasks."""
+    """
+    Render HTML table rows for the top `max_rows` tasks.
+
+    Every user-controlled string value is passed through html.escape()
+    before being interpolated into the HTML template. Without this, a real
+    CMMS work-order description or area field containing '<script>' or
+    similar would execute as JavaScript in the browser — a real risk when
+    loading data from a production system rather than the synthetic
+    generator. Numeric values interpolated into data-val attributes are
+    already safe because they're formatted as float/int strings by Python's
+    format spec, which never produces angle brackets or quotes.
+    """
+    import html
+
     rows_html = []
     for _, r in sched.head(max_rows).iterrows():
-        rl = str(r.get("risk_level", "LOW")).upper()
-        dec = str(r.get("decision", "DEFER")).upper()
-        pri = str(r.get("priority", "Low")).title()
+        rl = html.escape(str(r.get("risk_level", "LOW")).upper())
+        dec = html.escape(str(r.get("decision", "DEFER")).upper())
+        pri = html.escape(str(r.get("priority", "Low")).title())
 
         rl_cls = f"badge-{rl.lower()}"
         dec_cls = "badge-include" if dec == "INCLUDE" else "badge-defer"
@@ -627,10 +640,10 @@ def _build_table_rows(sched: pd.DataFrame, max_rows: int = 250) -> str:
 
         rows_html.append(f"""
         <tr>
-          <td>{r.wo_id}</td>
-          <td>{r.asset_tag}</td>
-          <td>{r.area}</td>
-          <td>{r.task_type}</td>
+          <td>{html.escape(str(r.wo_id))}</td>
+          <td>{html.escape(str(r.asset_tag))}</td>
+          <td>{html.escape(str(r.area))}</td>
+          <td>{html.escape(str(r.task_type))}</td>
           <td><span class="badge {pri_cls}">{pri}</span></td>
           <td><span class="badge {dec_cls}">{dec}</span></td>
           <td data-val="{cost:.0f}">${cost:>12,.0f}</td>
@@ -653,10 +666,23 @@ def _to_div(fig: go.Figure, height: int = 340) -> str:
 @timed
 def generate_dashboard(
     result: SolverResult,
-    out_path: Path = DASHBOARD_DIR / "turnaround_dashboard.html",
+    out_path: str | Path | None = None,
 ) -> Path:
-    """Render the full executive dashboard to a standalone HTML file."""
+    """
+    Render the full executive dashboard to a standalone HTML file.
+
+    `out_path` accepts either a `str` or `Path` and is coerced to `Path`
+    internally — see export_to_excel()'s docstring in src/reporting/export.py
+    for why a bare string used to crash here too (`.parent.mkdir(...)` and
+    `.write_text(...)` both require a true Path object). Defaults to `None`,
+    resolved against `DASHBOARD_DIR` inside the function body rather than
+    baked into the signature at import time.
+    """
     from datetime import datetime
+
+    if out_path is None:
+        out_path = DASHBOARD_DIR / "turnaround_dashboard.html"
+    out_path = Path(out_path)
 
     sched = result.schedule
     sel = result.selected_schedule

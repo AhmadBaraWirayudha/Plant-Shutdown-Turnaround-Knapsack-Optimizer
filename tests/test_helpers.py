@@ -7,6 +7,9 @@ import json
 import tempfile
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 from src.utils.helpers import fmt_usd, fmt_pct, fmt_hours, write_run_log, timed, print_banner
 
 
@@ -51,6 +54,87 @@ class TestWriteRunLog:
             with open(log_path) as fh:
                 loaded = json.load(fh)
             assert "some/file.xlsx" in loaded["output_path"]
+
+
+class TestWriteRunLogNumpyTypeFidelity:
+    """
+    Regression tests for a real bug: numpy scalar types (np.int64,
+    np.float64, np.bool_ — extremely common in any dict built from
+    pandas/numpy reductions like .sum()/.mean()) used to be silently
+    stringified by the old `default=str` JSON fallback. This didn't crash,
+    which made it easy to miss, but it corrupted type fidelity in the
+    audit trail: np.int64(222) became the JSON STRING "222" rather than
+    the number 222, and most dangerously, np.bool_(False) became the
+    string "False" — which is TRUTHY when reloaded and tested with
+    `if value:` in Python, silently inverting the original boolean for any
+    downstream consumer of the audit log.
+    """
+
+    def test_numpy_int_is_a_real_json_number_not_a_string(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = write_run_log(Path(tmp), {"count": np.int64(222)})
+            raw = open(log_path).read()
+            # The raw JSON text must contain a bare number, not a quoted string
+            assert '"count": 222' in raw
+            loaded = json.load(open(log_path))
+            assert loaded["count"] == 222
+            assert isinstance(loaded["count"], int)
+
+    def test_numpy_float_is_a_real_json_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = write_run_log(Path(tmp), {"cost": np.float64(4999401.08)})
+            loaded = json.load(open(log_path))
+            assert isinstance(loaded["cost"], float)
+            assert loaded["cost"] == pytest.approx(4999401.08)
+
+    def test_numpy_bool_false_round_trips_as_false_not_truthy_string(self):
+        """The specific dangerous case: a False value must reload as
+        Python False, not as the truthy string "False"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = write_run_log(Path(tmp), {"flag": np.bool_(False)})
+            raw = open(log_path).read()
+            assert '"flag": false' in raw  # real JSON boolean, not a quoted string
+            loaded = json.load(open(log_path))
+            assert loaded["flag"] is False
+            assert bool(loaded["flag"]) is False  # would be True if it had become "False"
+
+    def test_numpy_bool_true_round_trips_correctly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = write_run_log(Path(tmp), {"flag": np.bool_(True)})
+            loaded = json.load(open(log_path))
+            assert loaded["flag"] is True
+
+    def test_multi_element_numpy_array_falls_back_to_string(self):
+        """Arrays (not scalars) can't be reduced via .item() — must still
+        fall back to a safe string representation rather than crash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = write_run_log(Path(tmp), {"values": np.array([1, 2, 3])})
+            loaded = json.load(open(log_path))
+            assert isinstance(loaded["values"], str)
+
+    def test_mixed_numpy_and_native_and_path_types_all_correct(self):
+        """The realistic case: a summary dict with a mix of numpy scalars,
+        native Python types, and Path objects must all serialize with the
+        correct respective JSON types in one pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            metadata = {
+                "tasks_selected": np.int64(199),
+                "budget_used_usd": np.float64(4999232.39),
+                "mandatory": np.bool_(True),
+                "excel_path": Path("/reports/export.xlsx"),
+                "native_int": 42,
+                "native_str": "OPTIMAL",
+            }
+            log_path = write_run_log(Path(tmp), metadata)
+            loaded = json.load(open(log_path))
+            assert loaded == {
+                "tasks_selected": 199,
+                "budget_used_usd": pytest.approx(4999232.39),
+                "mandatory": True,
+                "excel_path": "/reports/export.xlsx",
+                "native_int": 42,
+                "native_str": "OPTIMAL",
+            }
 
 
 class TestTimedDecorator:

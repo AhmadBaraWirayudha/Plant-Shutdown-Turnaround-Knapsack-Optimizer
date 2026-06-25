@@ -29,6 +29,28 @@ STATUS_NAMES = {
 }
 
 
+def _safe_ratio(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """
+    numerator / denominator, returning `default` instead of raising
+    ZeroDivisionError when denominator is 0.
+
+    A zero-capacity trade (e.g. `--civil-hours 0`, a legitimate
+    configuration for a turnaround with no planned civil-craft work) makes
+    the budget/craft-hour constraint `Σ hours_i · x_i ≤ 0`, which forces
+    the corresponding `used` value to also be exactly 0 for any feasible
+    solve — so 0/0 here always genuinely means "0 used out of 0 available,"
+    and 0.0 is the correct utilisation, not a meaningless or thrown-away
+    edge case. This was a real, confirmed bug: any of total_budget,
+    max_mech_hours, max_elec_hours, max_inst_hours, or max_civil_hours set
+    to 0 used to crash `_extract_results()` with an unhandled
+    ZeroDivisionError, before the solver even returned a result, regardless
+    of how the rest of the problem was configured.
+    """
+    if denominator == 0:
+        return default
+    return numerator / denominator
+
+
 # ─── Solver ───────────────────────────────────────────────────────────────────
 
 
@@ -148,21 +170,21 @@ class TurnaroundSolver:
             "mandatory_selected": mandatory_count,
             "budget_usd": cfg.total_budget,
             "budget_used_usd": round(float(budget_used), 2),
-            "budget_utilisation": round(float(budget_used) / cfg.total_budget, 4),
+            "budget_utilisation": round(_safe_ratio(float(budget_used), cfg.total_budget), 4),
             "max_mech_hours": cfg.max_mech_hours,
             "mech_hours_used": round(float(mech_used), 1),
-            "mech_utilisation": round(float(mech_used) / cfg.max_mech_hours, 4),
+            "mech_utilisation": round(_safe_ratio(float(mech_used), cfg.max_mech_hours), 4),
             "max_elec_hours": cfg.max_elec_hours,
             "elec_hours_used": round(float(elec_used), 1),
-            "elec_utilisation": round(float(elec_used) / cfg.max_elec_hours, 4),
+            "elec_utilisation": round(_safe_ratio(float(elec_used), cfg.max_elec_hours), 4),
             "max_inst_hours": cfg.max_inst_hours,
             "inst_hours_used": round(float(inst_used), 1),
-            "inst_utilisation": round(float(inst_used) / cfg.max_inst_hours, 4),
+            "inst_utilisation": round(_safe_ratio(float(inst_used), cfg.max_inst_hours), 4),
             "max_civil_hours": cfg.max_civil_hours,
             "civil_hours_used": round(float(civil_used), 1),
-            "civil_utilisation": round(float(civil_used) / cfg.max_civil_hours, 4),
+            "civil_utilisation": round(_safe_ratio(float(civil_used), cfg.max_civil_hours), 4),
             "total_net_value_usd": round(float(total_value), 2),
-            "roi_ratio": round(float(total_value) / max(float(budget_used), 1), 4),
+            "roi_ratio": round(_safe_ratio(float(total_value), float(budget_used)), 4),
             "total_risk_score_reduced": int(risk_reduced),
             "objective_value": cp.objective_value,
         }

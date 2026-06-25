@@ -15,6 +15,9 @@ ortools>=9.8.0            # Google OR-Tools CP-SAT solver
 # Database / Power BI integration
 sqlalchemy>=2.0.0         # star-schema ORM, swappable to Postgres/MySQL/SQL Server
 
+# CMMS connectivity
+requests>=2.31.0          # REST API extraction (src/etl/extract.py::load_from_api)
+
 # Visualization / Reporting
 plotly>=5.18.0            # Interactive charts
 openpyxl>=3.1.0           # Excel export (Power BI feed)

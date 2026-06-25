@@ -197,3 +197,231 @@ class TestRunTransformsWrapper:
         clean_wos, clean_fails = run_transforms(wos, failures)
         assert "priority_weight" in clean_wos.columns
         assert (clean_fails["time_to_failure_d"] > 0).all()
+
+
+class TestExtractLoadFunctionsResolveLiveDataRaw:
+    """
+    Regression tests for the same stale-default-argument pattern fixed
+    elsewhere (see docs/METHODOLOGY.md §5): load_work_orders/
+    load_asset_master/load_failure_history previously declared
+    `path: Path = DATA_RAW / "..."` directly in the signature, evaluated
+    once at import time. Nothing in this codebase currently mutates
+    DATA_RAW after import, so this was a latent consistency issue rather
+    than an actively-triggered bug — fixed here for consistency with the
+    project-wide remediation of this pattern class.
+    """
+
+    def test_load_work_orders_resolves_live_data_raw(self, monkeypatch, tmp_path):
+        import src.etl.extract as extract_mod
+
+        csv_path = tmp_path / "work_orders.csv"
+        pd.DataFrame(
+            {
+                "wo_id": ["WO-1"],
+                "asset_tag": ["PMP-0001"],
+                "asset_class": ["PMP"],
+                "area": ["Unit-100"],
+                "task_type": ["Repair"],
+                "priority": ["High"],
+                "mandatory": [True],
+                "predecessor_wo_id": [None],
+                "install_date": ["2020-01-01"],
+            }
+        ).to_csv(csv_path, index=False)
+
+        monkeypatch.setattr(extract_mod, "DATA_RAW", tmp_path)
+        df = extract_mod.load_work_orders()  # path omitted -> resolves live DATA_RAW
+        assert len(df) == 1
+        assert df.iloc[0]["wo_id"] == "WO-1"
+
+    def test_load_work_orders_explicit_path_overrides_data_raw(self, tmp_path):
+        from src.etl.extract import load_work_orders
+
+        csv_path = tmp_path / "custom_location.csv"
+        pd.DataFrame(
+            {
+                "wo_id": ["WO-9"],
+                "asset_tag": ["PMP-0009"],
+                "asset_class": ["PMP"],
+                "area": ["Unit-200"],
+                "task_type": ["Inspection"],
+                "priority": ["Low"],
+                "mandatory": [False],
+                "predecessor_wo_id": [None],
+                "install_date": ["2021-01-01"],
+            }
+        ).to_csv(csv_path, index=False)
+
+        df = load_work_orders(path=csv_path)
+        assert df.iloc[0]["wo_id"] == "WO-9"
+
+    def test_load_asset_master_accepts_plain_string_path(self, tmp_path):
+        from src.etl.extract import load_asset_master
+
+        csv_path = tmp_path / "asset_master.csv"
+        pd.DataFrame({"asset_tag": ["PMP-0001"], "asset_class": ["PMP"]}).to_csv(csv_path, index=False)
+        df = load_asset_master(path=str(csv_path))  # plain string, not Path
+        assert len(df) == 1
+
+    def test_load_asset_master_resolves_live_data_raw(self, monkeypatch, tmp_path):
+        import src.etl.extract as extract_mod
+
+        csv_path = tmp_path / "asset_master.csv"
+        pd.DataFrame({"asset_tag": ["VLV-0003"], "asset_class": ["VLV"]}).to_csv(csv_path, index=False)
+
+        monkeypatch.setattr(extract_mod, "DATA_RAW", tmp_path)
+        df = extract_mod.load_asset_master()  # path omitted -> resolves live DATA_RAW
+        assert df.iloc[0]["asset_tag"] == "VLV-0003"
+
+    def test_load_failure_history_resolves_live_data_raw(self, monkeypatch, tmp_path):
+        import src.etl.extract as extract_mod
+
+        csv_path = tmp_path / "failure_history.csv"
+        pd.DataFrame(
+            {
+                "asset_tag": ["PMP-0001"],
+                "asset_class": ["PMP"],
+                "time_to_failure_d": [500.0],
+                "failure_date": ["2024-01-01"],
+                "failure_mode": ["Wear"],
+                "severity": [3],
+            }
+        ).to_csv(csv_path, index=False)
+
+        monkeypatch.setattr(extract_mod, "DATA_RAW", tmp_path)
+        df = extract_mod.load_failure_history()  # path omitted -> resolves live DATA_RAW
+        assert len(df) == 1
+        assert df.iloc[0]["time_to_failure_d"] == 500.0
+
+    def test_load_failure_history_explicit_path(self, tmp_path):
+        from src.etl.extract import load_failure_history
+
+        csv_path = tmp_path / "custom.csv"
+        pd.DataFrame(
+            {
+                "asset_tag": ["HX-0002"],
+                "asset_class": ["HX"],
+                "time_to_failure_d": [800.0],
+                "failure_date": ["2023-06-01"],
+                "failure_mode": ["Fouling"],
+                "severity": [2],
+            }
+        ).to_csv(csv_path, index=False)
+        df = load_failure_history(path=csv_path)
+        assert df.iloc[0]["asset_tag"] == "HX-0002"
+
+
+class TestLoadFromDb:
+    """
+    Tests load_from_db() against a REAL local SQLite engine — no network
+    access required, since SQLAlchemy's sqlite:// dialect is purely
+    file/memory-based. Exercises the actual query-execution path, not just
+    a mock, while staying fully offline.
+    """
+
+    def test_executes_real_query_against_sqlite(self, tmp_path):
+        from src.etl.extract import load_from_db
+        from sqlalchemy import create_engine, text
+
+        db_path = tmp_path / "test_cmms.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE work_orders (wo_id TEXT, status TEXT)"))
+            conn.execute(text("INSERT INTO work_orders VALUES ('WO-1', 'Planned'), ('WO-2', 'Complete')"))
+
+        df = load_from_db(f"sqlite:///{db_path}", "SELECT * FROM work_orders WHERE status = 'Planned'")
+        assert len(df) == 1
+        assert df.iloc[0]["wo_id"] == "WO-1"
+
+    def test_returns_empty_dataframe_for_no_matching_rows(self, tmp_path):
+        from src.etl.extract import load_from_db
+        from sqlalchemy import create_engine, text
+
+        db_path = tmp_path / "test_cmms2.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE work_orders (wo_id TEXT, status TEXT)"))
+
+        df = load_from_db(f"sqlite:///{db_path}", "SELECT * FROM work_orders")
+        assert len(df) == 0
+
+
+class TestLoadFromApi:
+    """
+    Tests load_from_api() with requests.get mocked — no real network call.
+    """
+
+    def test_parses_list_response(self, monkeypatch):
+        from src.etl import extract as extract_mod
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return [{"wo_id": "WO-1", "cost": 1000}, {"wo_id": "WO-2", "cost": 2000}]
+
+        def _fake_get(url, headers=None, timeout=None):
+            assert url == "https://fake-cmms.example.com/api/work-orders"
+            return _FakeResponse()
+
+        monkeypatch.setattr(extract_mod.requests, "get", _fake_get)
+        df = extract_mod.load_from_api("https://fake-cmms.example.com/api/work-orders")
+        assert len(df) == 2
+        assert df.iloc[0]["wo_id"] == "WO-1"
+
+    def test_parses_wrapped_data_key_response(self, monkeypatch):
+        """Some CMMS APIs wrap the array in a top-level 'data' key rather
+        than returning a bare list — load_from_api must handle both."""
+        from src.etl import extract as extract_mod
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": [{"wo_id": "WO-9"}], "page": 1}
+
+        monkeypatch.setattr(extract_mod.requests, "get", lambda *a, **k: _FakeResponse())
+        df = extract_mod.load_from_api("https://fake-cmms.example.com/api/work-orders")
+        assert df.iloc[0]["wo_id"] == "WO-9"
+
+    def test_passes_bearer_token_in_headers(self, monkeypatch):
+        from src.etl import extract as extract_mod
+
+        captured = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        def _fake_get(url, headers=None, timeout=None):
+            captured["headers"] = headers
+            return _FakeResponse()
+
+        monkeypatch.setattr(extract_mod.requests, "get", _fake_get)
+        extract_mod.load_from_api("https://fake-cmms.example.com/api", token="secret-token-123")
+        assert captured["headers"] == {"Authorization": "Bearer secret-token-123"}
+
+    def test_no_token_means_no_auth_header(self, monkeypatch):
+        from src.etl import extract as extract_mod
+
+        captured = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        def _fake_get(url, headers=None, timeout=None):
+            captured["headers"] = headers
+            return _FakeResponse()
+
+        monkeypatch.setattr(extract_mod.requests, "get", _fake_get)
+        extract_mod.load_from_api("https://fake-cmms.example.com/api")
+        assert captured["headers"] == {}

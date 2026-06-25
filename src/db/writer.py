@@ -19,8 +19,10 @@ a half-written scenario.
 """
 
 from __future__ import annotations
+import threading
 import pandas as pd
 from sqlalchemy import Engine, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.db.schema import (
@@ -39,20 +41,77 @@ log = get_logger("db.writer")
 
 RISK_LEVEL_SORT_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
+# Guards init_db() against concurrent calls from multiple threads pointing
+# at the same engine — Base.metadata.create_all() uses checkfirst=True
+# internally but that is still a check-then-act sequence; two threads
+# racing through it can both "see" the table as absent and both try to
+# CREATE TABLE, producing "table already exists" errors.
+_init_db_lock = threading.Lock()
+
 
 def init_db(engine: Engine) -> None:
-    """Create every table in the star schema if it doesn't already exist."""
-    Base.metadata.create_all(engine)
+    """Create every table in the star schema if it doesn't already exist.
+    Thread-safe: the module-level lock prevents concurrent CREATE TABLE races."""
+    with _init_db_lock:
+        Base.metadata.create_all(engine)
     log.info("Schema ready: %s", ", ".join(Base.metadata.tables.keys()))
+
+
+def _insert_or_recover(session: Session, instance, requery_stmt):
+    """
+    Insert `instance` inside a SAVEPOINT (nested transaction). If a
+    concurrent writer already inserted a row with the same unique/primary
+    key in between our existence check and this insert, catch the
+    resulting IntegrityError, roll back just the savepoint (not the whole
+    outer transaction), and return the row that won the race instead of
+    crashing.
+
+    This closes a real, confirmed bug: every "SELECT existing, then INSERT
+    if missing" upsert below has a classic time-of-check-to-time-of-use
+    race. Two concurrent writers (multiple threads, or two separate
+    `run_optimizer.py` processes pointed at the same database — a entirely
+    plausible scenario for a small team) can both see a lookup value as
+    absent and both attempt to insert it; the table's UNIQUE constraint
+    correctly prevents the duplicate at the database level, but the
+    application code previously let that IntegrityError propagate and
+    abort the ENTIRE transaction, losing that writer's whole run. This
+    affects every supported backend (SQLite, Postgres, MySQL, SQL Server)
+    equally — it is not a SQLite-specific limitation, since the same race
+    is possible (and on a multi-writer production database, more likely)
+    under true MVCC concurrency too.
+
+    SAVEPOINT is standard SQL, supported identically across every backend
+    this project targets, so this fix needs no per-dialect branching.
+    """
+    try:
+        with session.begin_nested():
+            session.add(instance)
+            session.flush()
+        return instance
+    except IntegrityError:
+        log.debug(
+            "Concurrent writer already inserted this row (%s) — recovering "
+            "by re-querying instead of failing the whole transaction.",
+            type(instance).__name__,
+        )
+        existing = session.scalars(requery_stmt).first()
+        if existing is None:
+            # Genuinely unexpected: the insert failed on a uniqueness
+            # conflict, but a fresh query can't find the row that should
+            # have caused it. Re-raise rather than silently return None.
+            raise
+        return existing
 
 
 def _upsert_lookup_task_types(session: Session, schedule: pd.DataFrame) -> dict[str, int]:
     existing = {row.task_type_name: row.task_type_id for row in session.scalars(select(DimTaskType))}
     for name in schedule["task_type"].dropna().unique():
         if name not in existing:
-            row = DimTaskType(task_type_name=name)
-            session.add(row)
-            session.flush()  # populate autoincrement id immediately
+            row = _insert_or_recover(
+                session,
+                DimTaskType(task_type_name=name),
+                select(DimTaskType).where(DimTaskType.task_type_name == name),
+            )
             existing[name] = row.task_type_id
     return existing
 
@@ -62,9 +121,11 @@ def _upsert_lookup_priorities(session: Session, schedule: pd.DataFrame) -> dict[
     existing = {row.priority_name: row.priority_id for row in session.scalars(select(DimPriority))}
     for name in schedule["priority"].dropna().unique():
         if name not in existing:
-            row = DimPriority(priority_name=name, priority_weight=weight_map.get(name, 1))
-            session.add(row)
-            session.flush()
+            row = _insert_or_recover(
+                session,
+                DimPriority(priority_name=name, priority_weight=weight_map.get(name, 1)),
+                select(DimPriority).where(DimPriority.priority_name == name),
+            )
             existing[name] = row.priority_id
     return existing
 
@@ -73,12 +134,11 @@ def _upsert_lookup_risk_levels(session: Session, schedule: pd.DataFrame) -> dict
     existing = {row.risk_level_name: row.risk_level_id for row in session.scalars(select(DimRiskLevel))}
     for name in schedule["risk_level"].dropna().unique():
         if name not in existing:
-            row = DimRiskLevel(
-                risk_level_name=name,
-                sort_order=RISK_LEVEL_SORT_ORDER.get(name, 0),
+            row = _insert_or_recover(
+                session,
+                DimRiskLevel(risk_level_name=name, sort_order=RISK_LEVEL_SORT_ORDER.get(name, 0)),
+                select(DimRiskLevel).where(DimRiskLevel.risk_level_name == name),
             )
-            session.add(row)
-            session.flush()
             existing[name] = row.risk_level_id
     return existing
 
@@ -100,7 +160,8 @@ def _upsert_dim_asset(session: Session, schedule: pd.DataFrame) -> None:
     for _, row in asset_cols.iterrows():
         if row.asset_tag in known_tags:
             continue
-        session.add(
+        _insert_or_recover(
+            session,
             DimAsset(
                 asset_tag=row.asset_tag,
                 asset_class=row.asset_class,
@@ -112,7 +173,8 @@ def _upsert_dim_asset(session: Session, schedule: pd.DataFrame) -> None:
                 c_env=int(row.c_env),
                 c_prod=int(row.c_prod),
                 c_cost=int(row.c_cost),
-            )
+            ),
+            select(DimAsset).where(DimAsset.asset_tag == row.asset_tag),
         )
         known_tags.add(row.asset_tag)
         new_count += 1
@@ -154,8 +216,16 @@ def _insert_fact_rows(
     priority_map: dict[str, int],
     risk_level_map: dict[str, int],
 ) -> int:
+    DESCRIPTION_MAX_LEN = 500  # must match FactWorkOrderDecision.description's String(500)
+    n_truncated = 0
+
     facts = []
     for _, r in schedule.iterrows():
+        description = str(r.description)
+        if len(description) > DESCRIPTION_MAX_LEN:
+            n_truncated += 1
+            description = description[:DESCRIPTION_MAX_LEN]
+
         facts.append(
             FactWorkOrderDecision(
                 run_id=run_id,
@@ -164,7 +234,7 @@ def _insert_fact_rows(
                 priority_id=priority_map[r.priority],
                 risk_level_id=risk_level_map[r.risk_level],
                 wo_id=r.wo_id,
-                description=str(r.description)[:200],
+                description=description,
                 predecessor_wo_id=(None if pd.isna(r.get("predecessor_wo_id")) else str(r.predecessor_wo_id)),
                 mandatory=bool(r.mandatory),
                 age_days=float(r.age_days),
@@ -189,6 +259,16 @@ def _insert_fact_rows(
                 decision=str(r.decision),
             )
         )
+
+    if n_truncated:
+        log.warning(
+            "%d work order description(s) exceeded %d characters and were "
+            "truncated for database storage — full text is preserved in the "
+            "Excel export and HTML dashboard, which have no such limit.",
+            n_truncated,
+            DESCRIPTION_MAX_LEN,
+        )
+
     session.add_all(facts)
     session.flush()
     return len(facts)
@@ -200,15 +280,37 @@ def _create_latest_run_view(engine: Engine) -> None:
     BI import — "give me the current schedule" — needs no DAX filtering at
     all. The full `fact_work_order_decision` table remains available
     separately for cross-run / scenario-comparison reports.
+
+    Uses CREATE OR REPLACE VIEW on backends that support it (Postgres,
+    MySQL, SQL Server). For SQLite, wraps the DROP+CREATE in a SAVEPOINT
+    so a concurrent writer racing to recreate the same view only loses the
+    savepoint, not the whole outer transaction.
     """
-    with engine.begin() as conn:
-        conn.execute(text("DROP VIEW IF EXISTS latest_run_facts"))
-        conn.execute(text("""
-                CREATE VIEW latest_run_facts AS
-                SELECT f.*
-                FROM fact_work_order_decision f
-                WHERE f.run_id = (SELECT MAX(run_id) FROM dim_run)
-                """))
+    view_sql = """
+        SELECT f.*
+        FROM fact_work_order_decision f
+        WHERE f.run_id = (SELECT MAX(run_id) FROM dim_run)
+    """
+    dialect = engine.dialect.name
+
+    if dialect in ("postgresql", "mysql", "mssql"):
+        with engine.begin() as conn:
+            conn.execute(text(f"CREATE OR REPLACE VIEW latest_run_facts AS {view_sql}"))
+    else:
+        # SQLite: no CREATE OR REPLACE VIEW — use DROP+CREATE inside a
+        # SAVEPOINT so a concurrent race on the view only rolls back the
+        # savepoint, not the entire outer transaction.
+        with engine.begin() as conn:
+            try:
+                conn.execute(text("SAVEPOINT _view_sp"))
+                conn.execute(text("DROP VIEW IF EXISTS latest_run_facts"))
+                conn.execute(text(f"CREATE VIEW latest_run_facts AS {view_sql}"))
+                conn.execute(text("RELEASE SAVEPOINT _view_sp"))
+            except Exception:
+                conn.execute(text("ROLLBACK TO SAVEPOINT _view_sp"))
+                conn.execute(text("RELEASE SAVEPOINT _view_sp"))
+                log.debug("Concurrent writer already recreated latest_run_facts view — skipping.")
+
     log.info("View ready: latest_run_facts")
 
 

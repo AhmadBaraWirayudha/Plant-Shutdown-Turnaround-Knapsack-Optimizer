@@ -42,6 +42,34 @@ log = get_logger("reporting.export")
 
 RISK_LEVEL_SORT_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
+# Characters that cause Excel / LibreOffice Calc to interpret a cell value
+# as a formula. This is the standard "CSV/spreadsheet formula injection"
+# attack vector (OWASP-listed) — a real CMMS work-order description or
+# area field starting with '=' would execute as an arbitrary Excel formula
+# when opened, potentially calling HYPERLINK(), DDE(), or other dangerous
+# functions. Prefix these with a single apostrophe, which is Excel's
+# conventional "treat as plain text" escape and is invisible to the reader.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitise_formula_injection(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a copy of `df` with every string column scrubbed for formula
+    injection: values starting with a formula-trigger character are
+    prefixed with a single apostrophe, which signals to Excel/LibreOffice
+    that the cell is plain text rather than a formula.
+
+    Applied to every DataFrame written by export_to_excel() so that real
+    CMMS data containing arbitrary text in description/area/wo_id fields
+    cannot cause unexpected formula execution when the workbook is opened.
+    """
+    df = df.copy()
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        mask = df[col].astype(str).str.startswith(_FORMULA_PREFIXES, na=False)
+        if mask.any():
+            df.loc[mask, col] = "'" + df.loc[mask, col].astype(str)
+    return df
+
 
 def _build_dimension_sheets(sched: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
@@ -152,8 +180,23 @@ def _build_dimension_sheets(sched: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 
 @timed
-def export_to_excel(result: SolverResult, out_path: Path = REPORTS_DIR / "power_bi_export.xlsx") -> Path:
-    """Write multi-sheet Excel workbook; return the output path."""
+def export_to_excel(result: SolverResult, out_path: str | Path | None = None) -> Path:
+    """
+    Write multi-sheet Excel workbook; return the output path.
+
+    `out_path` accepts either a `str` or `Path` and is coerced to `Path`
+    internally — a caller passing a plain string (very natural, since most
+    file-path-accepting code is duck-typed) used to crash with
+    `AttributeError: 'str' object has no attribute 'parent'` the moment
+    `.parent.mkdir(...)` ran below. Defaults to `None`, resolved against
+    `REPORTS_DIR` inside the function body rather than baked into the
+    signature at import time — the same stale-default-argument class of
+    bug documented in docs/METHODOLOGY.md §5, applied here for consistency
+    even though nothing currently mutates REPORTS_DIR after import.
+    """
+    if out_path is None:
+        out_path = REPORTS_DIR / "power_bi_export.xlsx"
+    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sched = result.schedule
     sel = result.selected_schedule
@@ -278,16 +321,16 @@ def export_to_excel(result: SolverResult, out_path: Path = REPORTS_DIR / "power_
 
     # ── Write workbook ────────────────────────────────────────────────────
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        sched[keep].to_excel(writer, sheet_name="OptimizedSchedule", index=False)
-        sel[keep].to_excel(writer, sheet_name="Selected", index=False)
-        deferred[keep].to_excel(writer, sheet_name="Deferred", index=False)
+        _sanitise_formula_injection(sched[keep]).to_excel(writer, sheet_name="OptimizedSchedule", index=False)
+        _sanitise_formula_injection(sel[keep]).to_excel(writer, sheet_name="Selected", index=False)
+        _sanitise_formula_injection(deferred[keep]).to_excel(writer, sheet_name="Deferred", index=False)
         df_kpi.to_excel(writer, sheet_name="SummaryKPIs", index=False)
         df_cap.to_excel(writer, sheet_name="CapacityUtilization", index=False)
         df_crit.to_excel(writer, sheet_name="RiskMatrix")
-        df_area.to_excel(writer, sheet_name="ByArea", index=False)
-        df_eqp.to_excel(writer, sheet_name="ByEquipmentClass", index=False)
+        _sanitise_formula_injection(df_area).to_excel(writer, sheet_name="ByArea", index=False)
+        _sanitise_formula_injection(df_eqp).to_excel(writer, sheet_name="ByEquipmentClass", index=False)
         for sheet_name, df in dim_sheets.items():
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            _sanitise_formula_injection(df).to_excel(writer, sheet_name=sheet_name, index=False)
 
     log.info("✅  Excel export saved → %s", out_path)
     return out_path

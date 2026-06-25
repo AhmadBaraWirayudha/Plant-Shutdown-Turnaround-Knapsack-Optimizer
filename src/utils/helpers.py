@@ -61,6 +61,36 @@ def fmt_hours(value: float) -> str:
 
 
 # ─── Run-log writer ───────────────────────────────────────────────────────────
+def _json_safe_default(obj):
+    """
+    json.dump's `default` hook for values it can't natively serialize.
+
+    numpy scalar types (np.int64, np.float64, np.bool_, etc.) are
+    extremely common in any dict built from pandas/numpy computations —
+    `.sum()`, `.mean()`, and similar reductions all return numpy scalars,
+    not native Python types. A bare `default=str` (the previous
+    implementation) silently stringifies these: `np.int64(222)` becomes
+    the JSON string `"222"`, not the JSON number `222`, and — far more
+    dangerously — `np.bool_(False)` becomes the JSON string `"False"`,
+    which is TRUTHY when reloaded and tested with `if value:` in Python,
+    silently inverting the original boolean's meaning for any downstream
+    consumer of this audit log. This hook converts numpy scalars to their
+    correct native equivalent first via `.item()`, preserving JSON type
+    fidelity, and only falls back to `str()` for genuinely non-serializable
+    objects (e.g. Path, datetime) where stringification is actually correct.
+    """
+    if hasattr(obj, "item") and callable(obj.item):
+        # Covers every numpy scalar type (integer, floating, bool_, etc.)
+        # without importing numpy here, since this module has no other
+        # numpy dependency and importing it solely for an isinstance check
+        # would be a heavier coupling than this duck-typed check.
+        try:
+            return obj.item()
+        except (ValueError, AttributeError):
+            pass
+    return str(obj)
+
+
 def write_run_log(output_dir: Path, metadata: dict) -> Path:
     """Persist a JSON audit trail of every optimizer run."""
     import json
@@ -69,7 +99,7 @@ def write_run_log(output_dir: Path, metadata: dict) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = output_dir / f"run_log_{ts}.json"
     with open(log_path, "w") as fh:
-        json.dump(metadata, fh, indent=2, default=str)
+        json.dump(metadata, fh, indent=2, default=_json_safe_default)
     log.info("📋  Audit log saved → %s", log_path)
     return log_path
 
