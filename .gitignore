@@ -1,0 +1,61 @@
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ─── Virtual environments ─────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── Testing / coverage ───────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# ─── Generated data & reports (reproducible via the pipeline) ─────────────
+data/raw/*.csv
+data/processed/*.parquet
+data/processed/*.csv
+reports/*.xlsx
+reports/audit_logs/*.json
+dashboard/*.html
+database/*.db
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!reports/.gitkeep
+!dashboard/.gitkeep
+!database/.gitkeep
+
+# ─── IDE / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ─── Environment secrets ───────────────────────────────────────────────────
+.env
+.env.local
+
+# ─── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
