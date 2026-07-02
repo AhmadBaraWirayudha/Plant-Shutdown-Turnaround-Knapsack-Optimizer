@@ -321,6 +321,12 @@ def _fig_weibull_curves(sched: pd.DataFrame, top_n: int = 5) -> go.Figure:
     for _, row in top.iterrows():
         beta = float(row["fitted_beta"]) if "fitted_beta" in row and not pd.isna(row["fitted_beta"]) else 2.0
         eta = float(row["fitted_eta"]) if "fitted_eta" in row and not pd.isna(row["fitted_eta"]) else 1825.0
+        # Clamp to safe Weibull parameter ranges — weibull_min.sf() raises
+        # ValueError for beta <= 0 or eta <= 0. The internal fit_weibull()
+        # guarantees beta >= 1, but external CMMS data loaded via
+        # load_from_db()/load_from_api() could carry arbitrary column values.
+        beta = max(beta, 0.01)
+        eta = max(eta, 1.0)
         R = weibull_min.sf(t, beta, scale=eta, loc=0) * 100
 
         fig.add_trace(
@@ -420,7 +426,8 @@ def _fig_task_type_donut(sel: pd.DataFrame) -> go.Figure:
 
 
 def _kpi_html(kpis: dict) -> str:
-    sel_pct = kpis["tasks_selected"] / kpis["tasks_total"] * 100
+    tasks_total = kpis["tasks_total"]
+    sel_pct = kpis["tasks_selected"] / tasks_total * 100 if tasks_total > 0 else 0.0
     bud_pct = kpis["budget_utilisation"] * 100
     roi = kpis["roi_ratio"]
 

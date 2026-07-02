@@ -1,11 +1,11 @@
 # Database Schema
 
 The optimizer persists every run into a star schema — one fact table
-surrounded by five dimension tables — rather than a single flat dump. This
-document is the schema reference; see
-[`power_bi/README.md`](../power_bi/README.md) for how to connect Power BI
-to it, and [`src/db/schema.py`](../src/db/schema.py) for the SQLAlchemy
-ORM source of truth.
+surrounded by six dimension tables (including the new `dim_scenario`
+collaboration layer) — rather than a single flat dump. This document is the
+schema reference; see [`power_bi/README.md`](../power_bi/README.md) for how
+to connect Power BI to it, and [`src/db/schema.py`](../src/db/schema.py) for
+the SQLAlchemy ORM source of truth.
 
 ## Why a star schema instead of one flat table
 
@@ -22,23 +22,53 @@ and performantly than against one denormalized sheet.
 just "normalized for its own sake" — every execution of the optimizer
 (different budget, different craft-hour caps, a different turnaround date)
 is its own row, so a single Power BI report can slice any visual by
-scenario and build a live budget-sensitivity page from real stored
-history.
+scenario and build a live budget-sensitivity page from real stored history.
+
+`dim_scenario` sits one level above `dim_run` — it is the collaborative
+planning container that multiple planners share. A scenario can exist before
+it is ever solved (draft parameters), be solved multiple times (each solve
+adds a `dim_run` row), and be compared side-by-side with any other scenario
+via `src/scenarios/comparison.py`. See §Scenario vs. Run below.
 
 ## Entity-relationship diagram
 
 ```mermaid
 erDiagram
+    DIM_SCENARIO ||--o{ DIM_RUN : "scopes (optional)"
     DIM_RUN ||--o{ FACT_WORK_ORDER_DECISION : "scopes"
     DIM_ASSET ||--o{ FACT_WORK_ORDER_DECISION : "describes"
     DIM_TASK_TYPE ||--o{ FACT_WORK_ORDER_DECISION : "categorizes"
     DIM_PRIORITY ||--o{ FACT_WORK_ORDER_DECISION : "ranks"
     DIM_RISK_LEVEL ||--o{ FACT_WORK_ORDER_DECISION : "classifies"
 
+    DIM_SCENARIO {
+        int scenario_id PK
+        string name "unique, max 120 chars"
+        string description
+        string created_by
+        datetime created_at
+        datetime updated_at
+        string status "DRAFT | LOCKED | ARCHIVED"
+        string locked_by "null when DRAFT/ARCHIVED"
+        datetime locked_at
+        int version "optimistic-CAS token"
+        bool is_shared
+        int parent_scenario_id FK "self-ref: clone source"
+        float budget_adjustment_pct "informational; set by clone_scenario()"
+        string turnaround_date "null = inherit from TA_CFG"
+        float budget_usd "null = inherit from TA_CFG"
+        float max_mech_hours "null = inherit from TA_CFG"
+        float max_elec_hours "null = inherit from TA_CFG"
+        float max_inst_hours "null = inherit from TA_CFG"
+        float max_civil_hours "null = inherit from TA_CFG"
+        int current_run_id "plain int, not FK — see design notes"
+    }
+
     DIM_RUN {
         int run_id PK
         datetime run_timestamp
         string run_label
+        int scenario_id FK "null for ad-hoc (non-scenario) runs"
         string turnaround_date
         float budget_usd
         float max_mech_hours
@@ -129,6 +159,44 @@ multiple runs/scenarios — its `selected`, `net_value_usd`, and other
 per-run measures can differ between runs even though it's the same
 physical task.
 
+**Scenario vs. Run**: `dim_run` is an immutable, append-only execution record
+— every solve adds one row and existing rows are never edited. `dim_scenario`
+is the mutable, collaborative container planners actually work in. It can
+exist with no runs yet (a draft), accumulate multiple runs as the planner
+iterates, and be locked while one planner is mid-edit. `current_run_id`
+always points at the most recent solve, which is what
+`compare_scenarios(engine, sid_a, sid_b)` compares. Ad-hoc runs (every
+existing test, every plain `run_optimizer.py` invocation without
+`--scenario-id`) set `dim_run.scenario_id = NULL` and remain fully
+supported — the scenario system is additive, not a replacement.
+
+**`dim_scenario.current_run_id` is NOT a foreign key**: This column points
+at a `dim_run` row, but is declared as a plain `Integer`. The reason is the
+circular-dependency problem: `dim_run.scenario_id` is already a FK pointing
+at `dim_scenario`, so a FK pointing back from `dim_scenario.current_run_id`
+to `dim_run.run_id` creates a cycle. SQLite's `ALTER TABLE` cannot add a
+FK constraint to an existing table at all, and this project targets all four
+backends identically. The invariant ("current_run_id always names a dim_run
+row that has this scenario's scenario_id") is guaranteed by construction —
+it is set in exactly one place: `src/scenarios/runner.py::solve_scenario()`,
+immediately after `write_results_to_db()` commits.
+
+**`dim_scenario.status` is a String, not a SQL ENUM**: SQLite has no native
+ENUM type; Postgres, MySQL, and SQL Server each use different ENUM syntax.
+A portable `String(12)` column validated at the single application layer
+that writes it (`src/scenarios/manager.py`) avoids three different ENUM
+dialects. Valid values are defined in `ScenarioStatus` constants: `DRAFT`,
+`LOCKED`, `ARCHIVED`.
+
+**`version` column and optimistic concurrency**: Every write to
+`dim_scenario` goes through a single `UPDATE ... WHERE version = :expected`
+statement that atomically increments the version. If the row was already
+modified by another writer between the read and the write, `rowcount == 0`
+and `ScenarioConflictError` is raised. This closes the TOCTOU race that the
+advisory lock (`status`/`locked_by`) alone cannot prevent — two processes
+can both read `status = DRAFT` before either writes `LOCKED`. See
+`src/scenarios/manager.py::_compare_and_swap_update`.
+
 **`dim_asset` holds only stable identity attributes** — asset tag, class,
 name, area, replacement value, and consequence ratings. It deliberately
 does **not** include `age_days` or `failure_prob`, because those are
@@ -169,3 +237,4 @@ applies identically; see [`power_bi/README.md`](../power_bi/README.md)
 Option D for the production deployment path, which also gets you a native
 (no-ODBC) Power BI connector and full Power BI Service scheduled-refresh
 support.
+

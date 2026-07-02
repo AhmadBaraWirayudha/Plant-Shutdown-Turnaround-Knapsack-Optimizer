@@ -306,7 +306,7 @@ def _create_latest_run_view(engine: Engine) -> None:
                 conn.execute(text("DROP VIEW IF EXISTS latest_run_facts"))
                 conn.execute(text(f"CREATE VIEW latest_run_facts AS {view_sql}"))
                 conn.execute(text("RELEASE SAVEPOINT _view_sp"))
-            except Exception:
+            except Exception:  # pragma: no cover
                 conn.execute(text("ROLLBACK TO SAVEPOINT _view_sp"))
                 conn.execute(text("RELEASE SAVEPOINT _view_sp"))
                 log.debug("Concurrent writer already recreated latest_run_facts view — skipping.")

@@ -201,3 +201,25 @@ class TestCriticalityMatrix:
         scored = compute_risk_scores(sample_wos)
         matrix = build_criticality_matrix(scored)
         assert matrix.values.sum() == len(scored)
+
+    def test_empty_dataframe_returns_zero_5x5_matrix_not_crash(self):
+        """
+        Regression test: build_criticality_matrix() used to raise
+        'ValueError: cannot set a frame with no defined columns' when
+        called with an empty DataFrame — a realistic edge case when the
+        full schedule has zero rows (e.g. from a programmatic API call
+        bypassing the normal validation path). Must return a zero-filled
+        5×5 matrix instead.
+        """
+        empty = pd.DataFrame(columns=["likelihood_tier", "consequence_tier"])
+        matrix = build_criticality_matrix(empty)
+        assert matrix.shape == (5, 5)
+        assert (matrix.values == 0).all()
+
+    def test_missing_tier_columns_returns_zero_matrix_not_crash(self):
+        """Columns might not exist if a DataFrame was built without going
+        through compute_risk_scores()."""
+        df_no_cols = pd.DataFrame({"wo_id": ["WO-1"]})
+        matrix = build_criticality_matrix(df_no_cols)
+        assert matrix.shape == (5, 5)
+        assert (matrix.values == 0).all()

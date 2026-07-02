@@ -418,6 +418,8 @@ class TestLoadFromApi:
             def json(self):
                 return []
 
+            headers = {}
+
         def _fake_get(url, headers=None, timeout=None):
             captured["headers"] = headers
             return _FakeResponse()
@@ -425,3 +427,52 @@ class TestLoadFromApi:
         monkeypatch.setattr(extract_mod.requests, "get", _fake_get)
         extract_mod.load_from_api("https://fake-cmms.example.com/api")
         assert captured["headers"] == {}
+
+    def test_raises_clear_error_on_non_json_response(self, monkeypatch):
+        """
+        Regression test: a proxy returning an HTML error page produces a
+        JSONDecodeError, not an HTTP error code, so raise_for_status()
+        alone misses it. load_from_api() must catch it and re-raise with
+        a message that tells the user what actually happened.
+        """
+        from src.etl import extract as extract_mod
+        import json
+
+        class _HtmlResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise json.JSONDecodeError("Expecting value", "", 0)
+
+            headers = {"Content-Type": "text/html"}
+
+        monkeypatch.setattr(extract_mod.requests, "get", lambda *a, **k: _HtmlResponse())
+        with pytest.raises(ValueError, match="non-JSON"):
+            extract_mod.load_from_api("https://fake-cmms.example.com/api")
+
+    def test_api_key_in_url_is_not_logged(self, monkeypatch, caplog):
+        """
+        Regression test: query-string credentials (e.g. ?api_key=SECRET)
+        must not appear in log output — the URL is sanitized before logging.
+        """
+        import logging
+        from src.etl import extract as extract_mod
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+            headers = {}
+
+        monkeypatch.setattr(extract_mod.requests, "get", lambda *a, **k: _FakeResponse())
+        with caplog.at_level(logging.INFO):
+            extract_mod.load_from_api("https://fake-cmms.example.com/api?api_key=SUPERSECRET&format=json")
+
+        full_log = " ".join(r.message for r in caplog.records)
+        assert "SUPERSECRET" not in full_log
+        # The base URL should still appear so the log is useful
+        assert "fake-cmms.example.com" in full_log

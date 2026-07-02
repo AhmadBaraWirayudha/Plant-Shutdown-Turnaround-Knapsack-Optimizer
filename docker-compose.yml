@@ -13,6 +13,7 @@ services:
       - ./data/processed:/app/data/processed
       - ./reports:/app/reports
       - ./dashboard:/app/dashboard
+      - ./database:/app/database
     environment:
       - TA_BUDGET=5000000
       - TA_DATE=2026-10-01

@@ -92,3 +92,76 @@ def fact_row_count(engine: Engine, run_id: int | None = None) -> int:
         else:
             stmt = select(FactWorkOrderDecision)
         return len(conn.execute(stmt).fetchall())
+
+
+# ─── Scenario-aware queries ───────────────────────────────────────────────────
+
+
+def list_scenario_runs(engine: Engine, scenario_id: int) -> pd.DataFrame:
+    """
+    All dim_run rows tagged with ``scenario_id``, most recent first.
+
+    Useful for showing a scenario's full solve history — not just the latest
+    (``current_run_id``) but every iteration the planner has ever triggered.
+    """
+    query = (
+        select(DimRun)
+        .where(DimRun.scenario_id == scenario_id)
+        .order_by(DimRun.run_id.desc())
+    )
+    return pd.read_sql(query, engine)
+
+
+def get_scenario_facts(engine: Engine, scenario_id: int) -> pd.DataFrame:
+    """
+    Per-work-order decisions for a scenario's LATEST solve (``current_run_id``).
+
+    Returns the same joined columns as ``get_run_facts``, so callers can use
+    either interchangeably once they have a scenario_id.
+
+    Raises ``KeyError`` if the scenario has no ``current_run_id`` (not yet solved).
+    """
+    from sqlalchemy.orm import Session
+    from src.db.schema import DimScenario
+
+    with Session(engine) as session:
+        scenario = session.get(DimScenario, scenario_id)
+        if scenario is None:
+            raise KeyError(f"scenario_id={scenario_id} not found")
+        if scenario.current_run_id is None:
+            raise KeyError(
+                f"Scenario {scenario_id} ({scenario.name!r}) has not been solved yet. "
+                "Call solve_scenario() first."
+            )
+        run_id = scenario.current_run_id
+
+    return get_run_facts(engine, run_id)
+
+
+def scenario_kpi_history(engine: Engine, scenario_id: int) -> pd.DataFrame:
+    """
+    KPI time-series for a scenario — one row per solve, ordered oldest first.
+
+    Shows how the selected task count, budget used, net value, and ROI
+    evolved as the planner iterated on this scenario.
+    """
+    query = """
+        SELECT
+            r.run_id,
+            r.run_timestamp,
+            r.run_label,
+            r.budget_usd,
+            r.tasks_total,
+            r.tasks_selected,
+            r.budget_used_usd,
+            r.budget_utilisation,
+            r.total_net_value_usd,
+            r.roi_ratio,
+            r.total_risk_score_reduced,
+            r.solver_status,
+            r.solve_time_s
+        FROM dim_run r
+        WHERE r.scenario_id = :scenario_id
+        ORDER BY r.run_id ASC
+    """
+    return pd.read_sql(query, engine, params={"scenario_id": scenario_id})

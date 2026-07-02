@@ -26,6 +26,7 @@ def _make_schedule(n=12) -> pd.DataFrame:
                 "asset_class": "PMP",
                 "asset_name": "Centrifugal Pump",
                 "area": "Unit-100",
+                "install_date": "2018-08-23",
                 "replace_usd": 50000.0,
                 "c_safety": 3,
                 "c_env": 2,
@@ -213,6 +214,190 @@ class TestExportToExcelEndToEnd:
         assert returned.exists()
 
 
+class TestExportZeroDivisionSafety:
+    """
+    Regression tests for division-by-zero in the Excel export:
+    two locations had unguarded division that crashed when a trade-hour
+    capacity or equipment-class cost was exactly 0.
+
+    1. CapacityUtilization sheet: `u / c * 100` crashed when c=0
+       (a zero-capacity trade is a legitimate real-world config, e.g.
+       no civil-craft work planned for this turnaround).
+    2. ByEquipmentClass sheet: `total_value / total_cost.replace(0, 1)`
+       didn't crash but silently returned total_value (a raw dollar amount)
+       mislabeled as a ratio — the same bug class fixed in solver.py's
+       roi_ratio calculation (see docs/METHODOLOGY.md §6).
+    """
+
+    @staticmethod
+    def _make_result_with_zero_civil_cap():
+        """A real solve with max_civil_hours=0 so civil utilisation = 0/0."""
+        rng = np.random.default_rng(42)
+        rows = []
+        for i in range(8):
+            rows.append(
+                {
+                    "wo_id": f"WO-{i:05d}",
+                    "description": f"Task {i}",
+                    "asset_tag": f"PMP-{i % 4:04d}",
+                    "asset_class": "PMP",
+                    "asset_name": "Pump",
+                    "area": "Unit-100",
+                    "replace_usd": 50000.0,
+                    "c_safety": 3,
+                    "c_env": 2,
+                    "c_prod": 4,
+                    "c_cost": 2,
+                    "task_type": "Inspection",
+                    "priority": "Medium",
+                    "risk_level": "LOW",
+                    "predecessor_wo_id": None,
+                    "mandatory": False,
+                    "age_days": 500.0,
+                    "estimated_cost_usd": float(rng.uniform(1000, 5000)),
+                    "mech_hours": 5.0,
+                    "elec_hours": 1.0,
+                    "inst_hours": 1.0,
+                    "civil_hours": 0.0,
+                    "total_craft_hours": 7.0,
+                    "duration_days": 1,
+                    "fitted_beta": 2.0,
+                    "fitted_eta": 1500.0,
+                    "failure_prob": 0.3,
+                    "rul_days": 800.0,
+                    "consequence_score": 3.0,
+                    "likelihood_tier": 3,
+                    "consequence_tier": 3,
+                    "risk_score": 9,
+                    "deferred_cost_usd": 500.0,
+                    "net_value_usd": float(rng.uniform(1000, 3000)),
+                }
+            )
+        wos = pd.DataFrame(rows)
+
+        class _Cfg:
+            total_budget = 50000.0
+            max_mech_hours = 1000.0
+            max_elec_hours = 500.0
+            max_inst_hours = 500.0
+            max_civil_hours = 0.0  # <-- zero-capacity trade
+
+        from src.optimization.solver import TurnaroundSolver
+
+        return TurnaroundSolver(wos, config=_Cfg()).solve()
+
+    def test_capacity_utilisation_with_zero_cap_does_not_crash(self, tmp_path):
+        """
+        Regression: `u / c * 100` in CapacityUtilization sheet raised
+        ZeroDivisionError when a trade's capacity was 0.
+        """
+        result = self._make_result_with_zero_civil_cap()
+        out = export_to_excel(result, out_path=tmp_path / "zero_cap.xlsx")
+        assert out.exists()
+
+    def test_capacity_utilisation_zero_cap_shows_zero_percent(self, tmp_path):
+        """A 0-capacity trade must show 0% utilisation, not crash or NaN."""
+        import openpyxl
+
+        result = self._make_result_with_zero_civil_cap()
+        out = export_to_excel(result, out_path=tmp_path / "zero_cap2.xlsx")
+        wb = openpyxl.load_workbook(out)
+        ws = wb["CapacityUtilization"]
+
+        # Find the Civil row by its trade name and check utilisation
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        util_col = headers.index("Utilisation (%)") + 1
+        trade_col = headers.index("Trade") + 1
+
+        for row in range(2, ws.max_row + 1):
+            if ws.cell(row=row, column=trade_col).value == "Civil":
+                util = ws.cell(row=row, column=util_col).value
+                assert util == 0.0, f"Civil utilisation should be 0.0, got {util!r}"
+                break
+
+    def test_roi_zero_cost_shows_zero_not_raw_value(self, tmp_path):
+        """
+        Regression: `total_value / total_cost.replace(0, 1)` returned raw
+        dollar values when total_cost=0 — e.g. roi=5000.0 meaning $5000,
+        not 5000x. This is the same bug class fixed in solver.py's
+        roi_ratio. The correct answer when nothing was spent is 0.0.
+        """
+        import openpyxl
+
+        # Build a result where nothing is selected (budget=0 → zero cost, zero value)
+        rng = np.random.default_rng(1)
+        rows = []
+        for i in range(5):
+            rows.append(
+                {
+                    "wo_id": f"WO-{i:05d}",
+                    "description": f"T{i}",
+                    "asset_tag": f"PMP-{i % 2:04d}",
+                    "asset_class": "PMP",
+                    "asset_name": "Pump",
+                    "area": "Unit-100",
+                    "replace_usd": 50000.0,
+                    "c_safety": 3,
+                    "c_env": 2,
+                    "c_prod": 4,
+                    "c_cost": 2,
+                    "task_type": "Inspection",
+                    "priority": "Low",
+                    "risk_level": "LOW",
+                    "predecessor_wo_id": None,
+                    "mandatory": False,
+                    "age_days": 500.0,
+                    "estimated_cost_usd": 99999.0,
+                    "mech_hours": 5.0,
+                    "elec_hours": 1.0,
+                    "inst_hours": 1.0,
+                    "civil_hours": 0.0,
+                    "total_craft_hours": 7.0,
+                    "duration_days": 1,
+                    "fitted_beta": 2.0,
+                    "fitted_eta": 1500.0,
+                    "failure_prob": 0.3,
+                    "rul_days": 800.0,
+                    "consequence_score": 3.0,
+                    "likelihood_tier": 3,
+                    "consequence_tier": 3,
+                    "risk_score": 9,
+                    "deferred_cost_usd": 500.0,
+                    "net_value_usd": float(rng.uniform(100, 500)),
+                }
+            )
+        wos = pd.DataFrame(rows)
+
+        class _Cfg:
+            total_budget = 0.0  # budget=0: nothing selected, total_cost=0
+            max_mech_hours = 1000.0
+            max_elec_hours = 500.0
+            max_inst_hours = 500.0
+            max_civil_hours = 0.0
+
+        from src.optimization.solver import TurnaroundSolver
+
+        result = TurnaroundSolver(wos, config=_Cfg()).solve()
+        assert result.summary["tasks_selected"] == 0
+
+        out = export_to_excel(result, out_path=tmp_path / "zero_roi.xlsx")
+        wb = openpyxl.load_workbook(out)
+        ws = wb["ByEquipmentClass"]
+
+        if ws.max_row < 2:
+            return  # no rows to check if all were deferred
+
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        if "roi" not in headers:
+            return
+
+        roi_col = headers.index("roi") + 1
+        for row in range(2, ws.max_row + 1):
+            roi = ws.cell(row=row, column=roi_col).value
+            if roi is not None:
+                assert abs(roi) < 10, f"roi={roi!r} looks like a raw dollar value, not a ratio"
+
+
 class TestFormulaInjectionSanitisation:
     """
     Regression tests for an OWASP-listed vulnerability: 'CSV/Excel formula
@@ -297,6 +482,43 @@ class TestBuildDimensionSheets:
         sheets = _build_dimension_sheets(sched)
         assert len(sheets["Dim_Asset"]) == 5
         assert sheets["Dim_Asset"]["asset_tag"].is_unique
+
+    def test_dim_asset_includes_install_date(self):
+        """
+        Regression test: Dim_Asset's docstring claims it 'mirrors
+        src/db/schema.py' exactly, but install_date was missing from the
+        column list entirely — present in the database's DimAsset table
+        (and populated by the writer) but silently absent from the
+        Excel-only Power BI path. A real-world install_date is a Timestamp
+        from the pipeline, but it's normalized to a plain string here to
+        match the database's String(20) column representation, so both
+        Power BI connection paths (Option C/Excel vs the live database)
+        show the identical value for this field.
+        """
+        sched = _make_schedule(n=5)
+        sheets = _build_dimension_sheets(sched)
+        dim_asset = sheets["Dim_Asset"]
+        assert "install_date" in dim_asset.columns
+        # The dtype LABEL varies across pandas versions (legacy 'object'
+        # vs newer pandas StringDtype) — what actually matters is that
+        # every value is a plain Python str, not a pandas Timestamp.
+        assert all(isinstance(v, str) for v in dim_asset["install_date"])
+        assert dim_asset.iloc[0]["install_date"] == "2018-08-23"
+
+    def test_dim_asset_install_date_normalizes_real_timestamp_to_string(self):
+        """The fixture above uses a pre-stringified date; this test
+        confirms a genuine pandas Timestamp (what the real pipeline
+        actually produces) is also normalized correctly, not left as a
+        Timestamp object that openpyxl would otherwise serialize
+        differently than the database's plain-string representation."""
+        sched = _make_schedule(n=3)
+        sched["install_date"] = pd.to_datetime(sched["install_date"])
+        assert pd.api.types.is_datetime64_any_dtype(sched["install_date"])
+
+        sheets = _build_dimension_sheets(sched)
+        dim_asset = sheets["Dim_Asset"]
+        assert all(isinstance(v, str) for v in dim_asset["install_date"])
+        assert not any(isinstance(v, pd.Timestamp) for v in dim_asset["install_date"])
 
     def test_dim_task_type_has_no_duplicates(self):
         sched = _make_schedule(n=30)

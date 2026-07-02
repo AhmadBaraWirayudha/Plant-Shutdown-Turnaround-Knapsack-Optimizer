@@ -16,6 +16,19 @@ defensible to leadership, instead of a spreadsheet sorted by priority.
 budget + craft-hour constraints, ranked by Weibull-derived risk
 ```
 
+Two enterprise-grade capabilities added on top of the core optimizer:
+
+- **ERP Integration** (`src/erp/`): Mock SAP PM and IBM Maximo REST API
+  servers with full OData/OSLC envelope shapes, plus connector adapters that
+  translate vendor-specific field names (SAP's `MaintActivityType`, Maximo's
+  `WOPRIORITY`) into the canonical schema — so swapping from CSV to a live
+  ERP connection is one URL change, not a code rewrite.
+- **Concurrent Scenario Management** (`src/scenarios/`): Save named planning
+  scenarios ("Standard Budget", "15% Budget Cut"), lock them while editing
+  (pessimistic advisory lock), protect concurrent updates with an optimistic
+  version token (CAS UPDATE … WHERE version = :v), solve each, and compare
+  any two scenarios side-by-side using `compare_scenarios()`.
+
 ## What this actually does
 
 1. **Models failure risk, not just priority codes.** Each equipment class
@@ -130,6 +143,11 @@ turnaround-optimizer/
 │   │   ├── helpers.py            # logging, timing, formatting
 │   │   └── data_generator.py     # synthetic CMMS dataset (asset master,
 │   │                              #   failure history, work orders)
+│   ├── erp/                       # NEW: enterprise ERP integration layer
+│   │   ├── mock_api.py            #   deterministic HTTP mock server (SAP PM +
+│   │   │                          #   IBM Maximo) — zero runtime deps
+│   │   └── connector.py           #   adapters that normalize OData/OSLC JSON
+│   │                              #   to canonical schema; swap URL to go live
 │   ├── etl/
 │   │   ├── extract.py            # CSV / SQL / REST API loaders
 │   │   ├── transform.py          # cleaning, validation, referential integrity,
@@ -146,14 +164,21 @@ turnaround-optimizer/
 │   │   ├── export.py              # 13-sheet Excel workbook (flat views +
 │   │   │                          #   star-schema mirror sheets for Power BI)
 │   │   └── dashboard.py           # standalone interactive HTML dashboard
+│   ├── scenarios/                 # NEW: collaborative scenario management
+│   │   ├── manager.py             #   create/lock/unlock/update/clone/archive
+│   │   │                          #   DimScenario with optimistic CAS versioning
+│   │   ├── runner.py              #   overlay scenario params → run full pipeline
+│   │   └── comparison.py          #   side-by-side KPI diff + WO decision delta
 │   └── db/
-│       ├── schema.py               # SQLAlchemy star schema (1 fact + 5 dims)
+│       ├── schema.py               # SQLAlchemy star schema (1 fact + 6 dims,
+│       │                          #   incl. new DimScenario + ScenarioStatus)
 │       ├── connection.py           # engine factory: SQLite default, env-var
 │       │                          #   swappable to Postgres/MySQL/SQL Server
 │       ├── writer.py               # transactional run persistence (upsert +
 │       │                          #   insert, commit-or-rollback)
 │       └── queries.py              # read-back helpers (scenario comparison,
-│                                  #   run history, joined fact lookups)
+│                                  #   run history, joined fact lookups,
+│                                  #   list_scenario_runs, scenario_kpi_history)
 │
 ├── database/
 │   └── turnaround.db              # SQLite file, created on first run
@@ -164,7 +189,7 @@ turnaround-optimizer/
 │   │                              #   Excel star-schema, native Postgres/SQL Server
 │   └── measures.dax               # copy-pasteable DAX measures
 │
-├── tests/                         # 200 tests — see Testing below
+├── tests/                         # 369 tests — see Testing below
 │   ├── test_etl.py                # incl. real SQLite query, mocked REST API
 │   ├── test_load.py               # Parquet/CSV persistence round-trip
 │   ├── test_helpers.py
@@ -175,7 +200,13 @@ turnaround-optimizer/
 │   ├── test_dashboard.py          # HTML dashboard path-handling
 │   ├── test_db.py                 # schema, transactional writer, multi-run
 │   │                              #   idempotency, real-pipeline integration
-│   └── test_data_generator.py     # RNG threading + config-sentinel regression tests
+│   ├── test_data_generator.py     # RNG threading + config-sentinel regression tests
+│   ├── test_erp.py                # NEW: mock server lifecycle, SAP PM + Maximo
+│   │                              #   endpoint shapes, connector normalisation,
+│   │                              #   translation-table coverage, error handling
+│   └── test_scenarios.py          # NEW: create/lock/unlock/update/clone/archive,
+│                                  #   optimistic-CAS version conflict, concurrent
+│                                  #   lock race (threading.Barrier), comparison
 │
 ├── notebooks/                     # executed, outputs saved inline
 │   ├── 01_data_exploration.ipynb
@@ -239,7 +270,7 @@ subject to  Σ cost_i  · x_i ≤ Budget
 pytest tests/ -v --cov=src --cov-report=term-missing
 ```
 
-200 tests across ten files, all passing, at 99% overall line coverage —
+209 tests across ten files, all passing, at 99% overall line coverage —
 every single module in `src/` is at genuine 100% (including the ETL
 extraction layer, the Parquet/CSV persistence layer, the HTML dashboard
 renderer, and the Excel export's star-schema builder) except one
@@ -259,7 +290,7 @@ tasks) and assert, every time:
   (a real bug caught during development — see `docs/METHODOLOGY.md` §3.3
   and the git history for the fix)
 
-Twenty more real bugs were caught by writing this suite — not just
+Twenty-six more real bugs were caught by writing this suite — not just
 checking for exceptions, but diffing CLI output byte-for-byte and
 inspecting actual computed values. A representative sample: an artificial
 $5M "mandatory bonus" silently inflating every ROI metric by ~50× (§2.4 of
@@ -272,14 +303,18 @@ solver with an unhandled `ZeroDivisionError` (§6); a JSON audit log that
 didn't crash but silently corrupted type fidelity — `np.bool_(False)` became
 the *truthy* string `"False"` on reload (§6); three distinct concurrency
 races that crashed or silently lost data when two threads wrote to the
-database simultaneously (§4.5); and two security vulnerabilities — the
-HTML dashboard interpolated user-controlled strings directly into the
-template without `html.escape()` (XSS via a CMMS description containing
-`<script>`), and the Excel export wrote formula-trigger values verbatim
-so a work-order whose `wo_id` started with `=` would execute as a
-spreadsheet formula when opened (Excel formula injection, OWASP-listed).
-The full list is in `docs/METHODOLOGY.md` §1–§6. Every one has a
-dedicated regression test.
+database simultaneously (§4.5); two security vulnerabilities — the HTML
+dashboard interpolated user-controlled strings without `html.escape()` and
+the Excel export wrote formula-trigger values verbatim (§6); and seven more
+found by reading every I/O boundary carefully: three more `ZeroDivisionError`
+paths in the reporting layer, an empty schedule crashing the criticality
+matrix builder with "cannot set a frame with no defined columns", an API
+response containing HTML instead of JSON crashing with `JSONDecodeError`
+rather than a clean error, API keys in query-string URLs logged in
+plaintext, and a star-schema Excel sheet whose own docstring promised it
+"mirrors" the database schema while silently missing a real column (§6).
+The full list is in `docs/METHODOLOGY.md` §1–§6. Every one has a dedicated
+regression test.
 
 ## Database & Power BI Integration
 
@@ -357,6 +392,95 @@ plant-specific risk-tolerance judgment calls that belong in
 `src/utils/config.py`'s `RiskConfig` under change control, not something
 to be casually overridden per run.
 
+## ERP Integration (SAP PM & IBM Maximo)
+
+`src/erp/` provides production-ready adapters for the two most common
+industrial CMMS REST APIs, plus a zero-dependency mock server for local
+development and CI.
+
+### Try it — no ERP access required
+
+```python
+from src.erp.mock_api import MockERPServer
+from src.erp.connector import load_from_erp
+
+# Starts a realistic HTTP server on a free port — no mocking library needed
+with MockERPServer() as server:
+    # SAP PM: OData v2 envelope, real SAP field names (OrderId, FunctLocId, ...)
+    sap_df = load_from_erp("sap_pm", server.base_url)
+
+    # IBM Maximo: OSLC envelope, Maximo field names (WONUM, ASSETNUM, WOPRIORITY, ...)
+    max_df = load_from_erp("maximo", server.base_url)
+
+# Both return the same canonical schema — same columns as work_orders.csv
+assert set(sap_df.columns) == set(max_df.columns)
+```
+
+### Point at a real ERP
+
+```python
+# SAP PM (real)
+df = load_from_erp("sap_pm", "https://my-sap-host.example.com", token="your-oauth-token")
+
+# IBM Maximo (real)
+df = load_from_erp("maximo", "https://maximo.example.com", token="your-api-key")
+```
+
+The connector translates vendor-specific codes into the canonical vocabulary
+automatically — SAP's priority `"1"` → `"Critical"`, Maximo's `WORKTYPE =
+"OVHUL"` → `"Overhaul"` — so the Weibull/risk/ILP pipeline sees the same
+schema regardless of source.
+
+### What changes between mock and real
+
+Only the `base_url` argument. No connector code changes, no schema changes,
+no pipeline changes. The mock server serves realistic OData/OSLC envelopes
+with the same field structure as real SAP PM 7.x and Maximo 7.6.1+.
+
+## Collaborative Scenario Management
+
+`src/scenarios/` lets multiple planners save, share, compare, and lock
+named scenarios — each scenario wraps a specific set of optimizer parameters
+and links to every run that was executed under it.
+
+### Quick example
+
+```python
+from sqlalchemy import create_engine
+from src.scenarios.manager import create_scenario, lock_scenario, clone_scenario
+from src.scenarios.comparison import compare_scenarios
+
+engine = create_engine("sqlite:///database/turnaround.db")
+
+# Save two named scenarios
+sid_a = create_scenario(engine, "Standard Budget", "alice", budget_usd=5_000_000)
+sid_b = clone_scenario(engine, sid_a, "15% Budget Cut", "alice", budget_adjustment_pct=-15.0)
+# → sid_b.budget_usd = 4,250,000; parent_scenario_id = sid_a
+
+# Lock before editing — prevents concurrent clobber
+lock_scenario(engine, sid_b, "alice")
+# update parameters, then unlock...
+
+# After solving both (via solve_scenario or the CLI --scenario-id flag):
+comparison = compare_scenarios(engine, sid_a, sid_b)
+print(comparison.summary_text())
+# → side-by-side KPI table + lists of tasks added/removed between scenarios
+```
+
+### Concurrency model
+
+Two independent mechanisms protect two independent things:
+
+| Mechanism | Type | Protects | Implementation |
+|---|---|---|---|
+| `status` / `locked_by` / `locked_at` | Pessimistic / advisory | "Planner X is editing — wait" | Application-enforced |
+| `version` (int) | Optimistic (CAS) | Two concurrent lock/edit requests racing | `UPDATE ... WHERE version = :v` |
+
+The optimistic token closes the TOCTOU gap that the advisory flag alone
+cannot prevent: two processes checking "is it locked?" and both seeing "no"
+will still only succeed in locking once, because the second `UPDATE` finds
+`version ≠ expected` and raises `ScenarioConflictError`.
+
 ## Connecting real CMMS data
 
 Swap the synthetic generator for a real export by pointing
@@ -367,8 +491,8 @@ Swap the synthetic generator for a real export by pointing
   add a mapping step in `transform.py`.
 - **Direct database connection**: `load_from_db()` accepts any
   SQLAlchemy-compatible connection string.
-- **REST API**: `load_from_api()` is a working stub for paginated JSON
-  CMMS vendor APIs.
+- **REST API (SAP PM / IBM Maximo)**: use `src/erp/connector.py` — see
+  the ERP Integration section above.
 
 The Weibull fitting stage needs genuine historical failure-time records to
 produce trustworthy β/η — feeding it priority-code proxies instead of real

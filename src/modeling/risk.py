@@ -199,7 +199,20 @@ def build_criticality_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """
     Return a 5×5 pivot table (likelihood tiers vs consequence tiers)
     with task counts in each cell.  Used for heatmap visualisation.
+
+    Returns a zero-filled 5×5 matrix for an empty DataFrame rather than
+    crashing — a `ValueError: cannot set a frame with no defined columns`
+    was the previous behavior, reachable when a schedule with zero rows
+    was passed in.
     """
+    if df.empty or "likelihood_tier" not in df.columns or "consequence_tier" not in df.columns:
+        return pd.DataFrame(
+            0,
+            index=range(1, 6),
+            columns=range(1, 6),
+            dtype=int,
+        )
+
     pivot = (
         df.groupby(["likelihood_tier", "consequence_tier"])
         .size()

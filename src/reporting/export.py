@@ -84,6 +84,7 @@ def _build_dimension_sheets(sched: pd.DataFrame) -> dict[str, pd.DataFrame]:
         "asset_class",
         "asset_name",
         "area",
+        "install_date",
         "replace_usd",
         "c_safety",
         "c_env",
@@ -92,6 +93,14 @@ def _build_dimension_sheets(sched: pd.DataFrame) -> dict[str, pd.DataFrame]:
     ]
     present_asset_cols = [c for c in asset_cols if c in sched.columns]
     dim_asset = sched[present_asset_cols].drop_duplicates(subset=["asset_tag"]).reset_index(drop=True)
+    # Match src/db/schema.py's DimAsset.install_date, which is a String(20)
+    # column populated via str(row.get("install_date", "")) — formatting
+    # consistently here (not leaving a raw pandas Timestamp) keeps the
+    # Excel-only and database-backed Power BI paths showing the identical
+    # representation for this column, per power_bi/README.md's claim that
+    # both paths produce the same relationship model.
+    if "install_date" in dim_asset.columns:
+        dim_asset["install_date"] = dim_asset["install_date"].astype(str)
 
     dim_task_type = (
         pd.DataFrame({"task_type_name": sorted(sched["task_type"].dropna().unique())})
@@ -280,7 +289,7 @@ def export_to_excel(result: SolverResult, out_path: str | Path | None = None) ->
             "Capacity (h)": caps,
             "Used (h)": used,
             "Available (h)": [c - u for c, u in zip(caps, used)],
-            "Utilisation (%)": [round(u / c * 100, 1) for u, c in zip(used, caps)],
+            "Utilisation (%)": [round(u / c * 100, 1) if c > 0 else 0.0 for u, c in zip(used, caps)],
         }
     )
 
@@ -311,7 +320,10 @@ def export_to_excel(result: SolverResult, out_path: str | Path | None = None) ->
         .reset_index()
         .round(3)
     )
-    df_eqp["roi"] = (df_eqp["total_value"] / df_eqp["total_cost"].replace(0, 1)).round(2)
+    df_eqp["roi"] = df_eqp.apply(
+        lambda r: round(r["total_value"] / r["total_cost"], 2) if r["total_cost"] > 0 else 0.0,
+        axis=1,
+    )
 
     # ── Criticality matrix ────────────────────────────────────────────────
     df_crit = build_criticality_matrix(sched)

@@ -560,6 +560,61 @@ value with a single apostrophe (Excel's conventional "treat as plain
 text" escape, invisible to the reader) before every DataFrame is written
 to the workbook.
 
+**Three more division-by-zero risks in the reporting layer.** The Excel
+export's `CapacityUtilization` sheet computed `used / capacity * 100`
+without protecting against `capacity = 0`, and the `ByEquipmentClass`
+sheet's ROI column used `total_value / total_cost.replace(0, 1)` —
+the same `max(..., 1)` bug class already fixed in the solver: when
+`total_cost = 0` it silently returned the raw dollar value of
+`total_value` mislabeled as a ratio. The dashboard's KPI card computed
+`tasks_selected / tasks_total * 100` without protecting against zero
+tasks. All three now use the same `if denominator > 0 else 0.0` guard.
+
+**`load_from_api()` logged API keys and mishandled non-JSON responses.**
+Enterprise CMMS REST APIs frequently pass authentication as
+`?api_key=...` query parameters. The URL was previously logged in full,
+writing credentials to log sinks in plaintext; the endpoint is now
+sanitised via `urlsplit()` with the query string stripped before logging.
+Second: `resp.json()` raised `JSONDecodeError` when a proxy returned an
+HTML error page (`401 Unauthorized` intercepted by a corporate proxy is
+returned as an HTML login page, not a JSON error object) — `raise_for_status()` alone doesn't catch this because the HTTP status was
+`200 OK` from the proxy. The function now catches `JSONDecodeError` and
+re-raises as a `ValueError` with an actionable message.
+
+**Three more division-by-zero risks, found by re-running every edge case
+that had already been fixed once in solver.py.** The Excel export's
+`CapacityUtilization` sheet computed `used / capacity * 100` with no guard
+against `capacity = 0`; `ByEquipmentClass`'s ROI column used the same
+`.replace(0, 1)` anti-pattern already fixed once in the solver — returning
+the raw dollar value of `total_value` mislabeled as a ratio when
+`total_cost = 0`; and the dashboard's KPI card divided
+`tasks_selected / tasks_total` with no guard against zero tasks. All three
+now use the same `if denominator > 0 else 0.0` pattern established
+elsewhere. Separately, `build_criticality_matrix()` raised `ValueError:
+cannot set a frame with no defined columns` on an empty DataFrame — fixed
+with an early-return that produces a correctly-shaped zero-filled 5×5
+matrix instead of crashing. A Weibull curve chart was also hardened to
+clamp `beta`/`eta` away from zero before calling `weibull_min.sf()`,
+since `fit_weibull()` guarantees safe values internally but a real CMMS
+import via `load_from_db()`/`load_from_api()` could carry arbitrary
+column values that bypass that guarantee.
+
+**`Dim_Asset`'s docstring promised something the code didn't deliver.**
+The Excel export's star-schema mirror sheet (built specifically so
+Excel-only Power BI users get the same relationship model as the live
+database — see `power_bi/README.md` Option C) claims in its own docstring
+to "mirror src/db/schema.py" exactly. It didn't: `install_date` is a real
+column on the database's `DimAsset` table, populated by the writer, but
+was missing entirely from the Excel sheet's column list — a silent,
+undocumented divergence between the two supposedly-equivalent Power BI
+connection paths. The gap existed because the test fixture building sample
+schedules for `test_export.py` never included an `install_date` column
+either, so nothing ever exercised the path that would have caught it. Now
+fixed, with the column also normalized to a plain string (matching the
+database's `String(20)` representation) rather than left as a pandas
+`Timestamp`, so a value looks identical regardless of which Power BI
+connection path a user chooses.
+
 ## 7. Validation Philosophy
 
 Every constraint in §3.3 has a dedicated property-based test in
@@ -570,16 +625,212 @@ includes mandatory safety tasks, is more dangerous than no tool at all,
 because it will be trusted. The test suite exists to make "usually" into
 "always, or it raises loudly."
 
-The suite reaches 99% overall line coverage, with every single module in
-`src/` at genuine 100% — including the ETL extraction layer (CSV loaders,
-a real SQLAlchemy query against a local SQLite engine, and a mocked REST
-API client), the Parquet/CSV persistence layer, the HTML dashboard
-renderer, and the Excel export's star-schema builder — except one 4-line
-gap in `fit_weibull`. That gap is the innermost defensive branch — the
-case where scipy's MLE returns a non-finite or non-positive shape/scale
-*despite* receiving ≥3 finite, positive observations. That branch is real
-and intentional (it guards against a genuine, if rare, numerical-optimizer
-failure mode), but reliably forcing scipy's internals into that state
-requires mocking rather than constructing realistic adversarial data,
-which was judged not worth the resulting test fragility. It's documented
-here rather than hidden behind an inflated coverage number.
+The suite reaches 98% overall line coverage (369 tests across 11 test
+modules), with every single module in `src/` at genuine 100% except the
+known-unavoidable gaps documented below:
+- `src/scenarios/runner.py` at 54%: `solve_scenario` calls the full ILP
+  pipeline; covering it would require a multi-minute integration test that
+  regenerates synthetic data, fits Weibull curves, and writes to a database.
+  `build_config_for_scenario` — the logic that matters for correctness — is
+  at 100%, with a dedicated regression test confirming the global `TA_CFG`
+  singleton is never mutated.
+- `src/db/writer.py` lines 102, 297–298: two defensive branches that only
+  fire under specific concurrent race conditions (see §4.5).
+- `src/modeling/weibull.py` lines 66, 68–70: the `fit_weibull` defensive
+  branch where scipy's MLE returns non-finite output despite valid inputs
+  (documented in prior rounds).
+
+## 8. ERP Integration (SAP PM & IBM Maximo)
+
+### 8.1 The integration problem
+
+Production turnaround planning doesn't start from a CSV file. Work orders
+live in SAP PM, IBM Maximo, or a comparable CMMS, and pulling them out
+typically means navigating OData endpoints, OSLC paging, vendor-specific
+field names, and authentication flows that bear no resemblance to the clean
+canonical schema the optimizer actually works with. The gap between "vendor
+JSON" and "what the pipeline needs" is where most integration projects lose
+weeks to field-mapping spreadsheets.
+
+`src/erp/` collapses that gap into two files with a clear contract: the
+connector translates vendor-specific representations into the canonical
+schema; the rest of the pipeline never learns which system the data came
+from.
+
+### 8.2 Mock server architecture (no ERP required)
+
+`src/erp/mock_api.py` implements a realistic HTTP server with zero
+additional dependencies — Python's standard-library `http.server` only —
+that serves OData v2 JSON (SAP PM) and OSLC JSON (IBM Maximo) at the same
+endpoint paths the real systems use:
+
+```
+GET /sap/opu/odata/sap/PM_WORKORDER/MaintenanceOrder  → {"d":{"results":[...]}}
+GET /sap/opu/odata/sap/PM_WORKORDER/Equipment         → {"d":{"results":[...]}}
+GET /maximo/oslc/os/mxwo                              → {"member":[...],"oslc:totalCount":N}
+GET /maximo/oslc/os/mxasset                           → {"member":[...],"oslc:totalCount":N}
+```
+
+The server is managed as a context manager (`MockERPServer`) that binds to
+an OS-assigned free port (port 0) so multiple test processes can run
+concurrently without colliding. Payloads are generated once at module
+import time using a seeded RNG, making every CI run deterministic.
+
+The key design choice: the mock intentionally does NOT use `unittest.mock`
+or `responses` to intercept `requests.get()` at the library layer. Instead,
+it is a real HTTP server, meaning the connector's HTTP-error path, JSON
+content-type validation, and connection-refused handling are all tested
+against real network conditions rather than against a library patch that
+cannot catch "my code is calling the wrong URL."
+
+### 8.3 Field-mapping tables
+
+Both connectors maintain explicit translation tables rather than relying on
+string manipulation or format inference:
+
+**SAP PM:**
+- `MaintActivityType` codes (`PM01`–`PM07`) → canonical task types
+- Priority codes (`1`–`4`) → `Critical / High / Medium / Low`
+- Fields distributed across order + equipment master records → joined on `FunctLocId`
+
+**IBM Maximo:**
+- `WORKTYPE` codes (`INSPC`, `OVHUL`, …) → same canonical task types
+- `WOPRIORITY` integer (`1`–`4`) → same priority vocabulary
+- `ESTLABHRS` (total) → split 70/15/10/5 (mech/elec/inst/civil) when per-craft
+  hours are absent (a real Maximo deployment detail — per-craft data lives in
+  the LABOUR child table, which some API configurations omit)
+
+### 8.4 What changes when connecting a real system
+
+Only the `base_url` (and optionally the auth token). The connector
+functions — `load_from_sap_pm()`, `load_from_maximo()`, `load_from_erp()`
+— accept the same arguments; the rest of the pipeline is unchanged. The
+mock server's test coverage verifies the connector handles the same
+response envelopes a real system would return, so a developer can validate
+their integration against the mock before ever requesting production API
+credentials.
+
+### 8.5 A subtle generator bug caught by the test
+
+The initial Maximo mock generator computed per-craft hour fractions as:
+```python
+mech_frac = rng.uniform(0.4, 0.7)   # up to 0.7
+elec_frac = rng.uniform(0.1, 0.3)   # up to 0.3
+inst_frac = rng.uniform(0.05, 0.15) # up to 0.15
+civil_frac = max(0.0, 1.0 - mech_frac - elec_frac - inst_frac)
+```
+The three independent fractions can sum to 1.15 — more than 100% — so the
+`max(0.0, ...)` civil clamp fires, civil becomes 0, and the per-craft sum
+exceeds `ESTLABHRS`. The test `test_maximo_wo_total_craft_hours_match_sum`
+caught this: it asserts that `mech + elec + inst + civil == ESTLABHRS` for
+every generated row. Fixed by narrowing the ranges so the worst-case sum is
+0.85 and computing civil as `total_hrs - mech - elec - inst` from
+already-rounded values, not from the raw fractional remainder.
+
+## 9. Concurrent Scenario Management
+
+### 9.1 The collaboration problem
+
+When a single planner runs the optimizer with three different budgets and
+compares the outputs, the existing `dim_run` + multi-run query design
+(§4.1) already handles that. The collaboration problem is different: two
+planners, simultaneously, each building their own parameter set, each
+wanting to see the other's results, each able to accidentally overwrite the
+other's work.
+
+`src/scenarios/` adds a named, owned, lockable planning container —
+`DimScenario` — that sits one level above `dim_run`. A scenario exists
+before it's ever solved (a draft with chosen parameters), gets re-solved
+multiple times as planners iterate (each solve appends a new `dim_run` row
+tagged with `scenario_id`), and tracks its latest solve in `current_run_id`
+so "compare A vs B" always means "compare the most recent result of each."
+
+### 9.2 Two concurrency mechanisms protecting two different things
+
+It's tempting to solve the concurrent-edit problem with either a lock or a
+version token, but they protect different failure modes and both are needed:
+
+**Pessimistic / advisory lock** (`status`, `locked_by`, `locked_at`):
+Tells a second planner who is currently editing and since when. This is
+purely informational — it cannot prevent two processes from both deciding
+"the scenario is unlocked" before either acts, because between the check
+and the write, another process can acquire the lock.
+
+**Optimistic-concurrency token** (`version`): Closes the TOCTOU gap.
+Every write — locking, unlocking, updating parameters — goes through a
+single `UPDATE dim_scenario SET ... version = version + 1 WHERE
+scenario_id = :id AND version = :expected` statement (`_compare_and_swap_update`).
+If no row is updated (because `version` was already incremented by a
+concurrent writer), `rowcount == 0`, and `ScenarioConflictError` is raised
+before any application state changes. On all four supported backends (SQLite,
+Postgres, MySQL, SQL Server) this is atomic at the database layer.
+
+The concurrent-lock race test (`test_only_one_thread_wins_lock`) exercises
+this empirically: two threads release a `threading.Barrier` simultaneously
+and both call `lock_scenario()`. Exactly one wins; exactly one gets
+`ScenarioLockedError` or `ScenarioConflictError`; the database row is
+inspected afterward to confirm `version == 2` (not 3, which would indicate
+a double write).
+
+### 9.3 Why `current_run_id` is NOT a foreign key
+
+`DimScenario.current_run_id` points at a `dim_run` row, but it is declared
+as a plain `Integer` column rather than `ForeignKey("dim_run.run_id")`. The
+reason is the creation-order problem: `dim_run.scenario_id` is already a
+foreign key pointing at `dim_scenario.scenario_id` (creating the scenario
+→ runs relationship). A foreign key in the other direction (scenario
+→ current run) creates a cycle: neither table can be created first.
+
+Postgres, MySQL, and SQL Server can resolve this with a deferred constraint
+or `ALTER TABLE ... ADD CONSTRAINT` after both tables exist; SQLite's
+`ALTER TABLE` cannot add foreign-key constraints to an existing table at
+all. Rather than maintaining different schema-creation code for each
+backend, the invariant is enforced at the application layer: `current_run_id`
+is set in exactly one place — `runner.py::solve_scenario()`, immediately
+after `write_results_to_db()` commits — and nowhere else.
+
+### 9.4 `build_config_for_scenario` — the `None`-means-inherit guarantee
+
+The runner's `build_config_for_scenario()` overlays a scenario's parameter
+fields onto a copy of the baseline `TurnaroundConfig`. `None` means "inherit
+from base_cfg, not zero it out" — a distinction that matters because `0.0`
+is a valid (if unusual) budget value for the optimizer to solve with, and
+there is no other sentinel available in a plain `Float` column to mean
+"not set." The function reads each field explicitly:
+
+```python
+if scenario.budget_usd is not None:
+    cfg.total_budget = scenario.budget_usd
+```
+
+This makes the None case provably correct — a scenario created without a
+budget override produces the same result as not using the scenario system at
+all. The regression test `test_none_budget_does_not_zero_it_out` enforces
+this: it creates a scenario with `budget_usd=None`, calls
+`build_config_for_scenario`, and asserts the resulting config's
+`total_budget` equals the base config's value, not zero.
+
+The same test also asserts that the global `TA_CFG` singleton is not mutated
+by `build_config_for_scenario` — the same stale-default bug class as §5
+would have been just as easy to introduce here by doing `TA_CFG.total_budget
+= scenario.budget_usd` instead of `copy.copy(base_cfg)` first.
+
+### 9.5 `compare_scenarios` — the diff semantics
+
+`compare_scenarios(engine, sid_a, sid_b)` returns a `ScenarioComparison`
+with four non-overlapping work-order sets:
+
+```
+added       = selected in B, deferred in A
+removed     = selected in A, deferred in B
+common_in   = selected in both
+common_out  = deferred in both (appearing in either run's fact table)
+```
+
+The signed `delta` dict uses "B minus A" throughout, making it natural to
+read: scenario B is the "new" scenario being evaluated against scenario A
+as the baseline. A negative `delta_budget_usd` means B is a budget cut
+relative to A. A positive `delta_tasks_selected` means B fits more work into
+its budget. `compare_many_scenarios()` extends this to an arbitrary list of
+scenario IDs, returning a summary DataFrame suitable for a Power BI
+cross-scenario table or a notebook comparison view.

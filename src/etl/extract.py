@@ -111,12 +111,41 @@ def load_from_api(endpoint: str, token: str | None = None) -> pd.DataFrame:
     Fetch paginated JSON from a REST endpoint and flatten into a DataFrame.
 
     Swap in the real CMMS vendor API here (SAP PM, Maximo, etc.).
+
+    Two hardening fixes applied here vs the naive implementation:
+    - resp.json() is caught — a proxy returning an HTML error page (very
+      common in enterprise CMMS environments) produces a JSONDecodeError,
+      not an HTTP error code, so raise_for_status() alone misses it.
+    - The endpoint URL is stripped of any query-string parameters before
+      being logged, so API keys passed as `?api_key=...` are never written
+      to the audit trail or log files in plaintext.
     """
+    from urllib.parse import urlsplit
+
+    # Redact query string (may contain api_key= or token= parameters)
+    parsed = urlsplit(endpoint)
+    safe_url = parsed._replace(query="", fragment="").geturl()
+
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     resp = requests.get(endpoint, headers=headers, timeout=30)
     resp.raise_for_status()
-    payload = resp.json()
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        raise ValueError(
+            f"API at {safe_url!r} returned non-JSON content "
+            f"(Content-Type: {resp.headers.get('Content-Type', 'unknown')}). "
+            "Ensure the endpoint returns application/json."
+        ) from exc
+
     records = payload if isinstance(payload, list) else payload.get("data", payload)
+    if not isinstance(records, (list, dict)):
+        raise ValueError(
+            f"API response from {safe_url!r} has unexpected structure: "
+            f"expected a list or dict, got {type(records).__name__}."
+        )
+
     df = pd.json_normalize(records)
-    log.info("API returned %d records from %s", len(df), endpoint)
+    log.info("API returned %d records from %s", len(df), safe_url)
     return df
